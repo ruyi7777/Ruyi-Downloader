@@ -1,0 +1,7 @@
+{
+    "download_path": "",
+    "quality": "1080p",
+    "concurrent_tasks": 2,
+    "avoid_av1": true,
+    "output_format": "mp4"
+}
