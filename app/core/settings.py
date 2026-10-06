@@ -16,6 +16,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "concurrent_tasks": 2,
     "avoid_av1": True,
     "output_format": "mp4",
+    "ffmpeg_path": "",
 }
 
 

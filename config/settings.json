@@ -3,5 +3,6 @@
     "quality": "1080p",
     "concurrent_tasks": 2,
     "avoid_av1": true,
-    "output_format": "mp4"
+    "output_format": "mp4",
+    "ffmpeg_path": ""
 }

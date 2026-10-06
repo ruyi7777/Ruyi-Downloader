@@ -74,9 +74,14 @@ class YtDlpService:
         progress_callback: Optional[
             Callable[[DownloadProgress], None]
         ] = None,
+        ffmpeg_path: Optional[Path] = None,
     ) -> DownloadResult:
         """Download one video to the configured directory."""
-        options = _build_download_options(download_dir, progress_callback)
+        options = _build_download_options(
+            download_dir,
+            progress_callback,
+            ffmpeg_path,
+        )
 
         try:
             with YoutubeDL(options) as ydl:
@@ -111,6 +116,7 @@ class YtDlpService:
 def _build_download_options(
     download_dir: Path,
     progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+    ffmpeg_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     options: Dict[str, Any] = {
         "format": _DEFAULT_FORMAT,
@@ -128,6 +134,9 @@ def _build_download_options(
         "retries": 2,
         "fragment_retries": 2,
     }
+
+    if ffmpeg_path is not None:
+        options["ffmpeg_location"] = str(ffmpeg_path)
 
     if progress_callback is not None:
         options["progress_hooks"] = [
@@ -391,8 +400,11 @@ def _friendly_parse_error(detail: str) -> str:
 def _friendly_download_error(detail: str) -> str:
     message = detail.lower()
 
+    if _is_ffmpeg_missing(message):
+        return "未找到 FFmpeg，请安装 FFmpeg 或在设置中配置 FFmpeg 路径。"
+
     if "ffmpeg" in message or "ffprobe" in message:
-        return "当前格式需要 FFmpeg 才能完成，请确认 FFmpeg 可用"
+        return "FFmpeg 处理失败，请检查 FFmpeg 安装和路径"
 
     if any(
         marker in message
@@ -441,6 +453,22 @@ def _friendly_download_error(detail: str) -> str:
         return "视频不存在、已下架或无法访问"
 
     return "下载失败，请检查链接和网络后重试"
+
+
+def _is_ffmpeg_missing(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "ffmpeg not found",
+            "ffprobe not found",
+            "ffmpeg-location",
+            "ffmpeg not available",
+            "unable to find ffmpeg",
+            "cannot find ffmpeg",
+            "ffmpeg not installed",
+            "no ffmpeg",
+        )
+    )
 
 
 def _requires_login(message: str) -> bool:

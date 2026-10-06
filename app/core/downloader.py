@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from app.core.download_models import DownloadError, DownloadProgress, DownloadResult
 from app.core.settings import SettingsManager
+from app.services.ffmpeg_service import FFmpegLocation, FFmpegService
 from app.services.ytdlp_service import YtDlpService
 from app.utils.paths import ensure_directory, get_project_root
 
@@ -61,6 +62,9 @@ class VideoDownloader:
             self._log_failure(normalized_url, download_error.user_message, detail)
             raise download_error from error
 
+        ffmpeg_location = self._discover_ffmpeg()
+        ffmpeg_path = ffmpeg_location.path if ffmpeg_location else None
+
         logger.info(
             "Video download started: host=%s, directory=%s",
             _url_host(normalized_url),
@@ -72,6 +76,7 @@ class VideoDownloader:
                 normalized_url,
                 target_directory,
                 progress_callback=progress_callback,
+                ffmpeg_path=ffmpeg_path,
             )
         except DownloadError as error:
             self._log_failure(normalized_url, error.user_message, error.detail)
@@ -92,6 +97,24 @@ class VideoDownloader:
             result.file_name,
         )
         return result
+
+    def _discover_ffmpeg(self) -> Optional[FFmpegLocation]:
+        """Discover FFmpeg for this download using the configured override."""
+        service = FFmpegService(
+            configured_path=str(self.settings.get("ffmpeg_path", "") or "")
+        )
+        location = service.discover()
+        if location is not None:
+            logger.info(
+                "FFmpeg discovered: source=%s, path=%s",
+                location.source,
+                location.path,
+            )
+        else:
+            logger.warning(
+                "FFmpeg not found; downloads requiring merging may fail"
+            )
+        return location
 
     @staticmethod
     def _validate_url(url: str) -> None:
