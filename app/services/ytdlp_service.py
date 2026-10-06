@@ -4,12 +4,17 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
 
-from app.core.download_models import DownloadError, DownloadResult
+from app.core.download_models import (
+    DownloadError,
+    DownloadProgress,
+    DownloadResult,
+    DownloadStatus,
+)
 from app.core.video_info import VideoFormatInfo, VideoInfo, VideoParseError
 
 logger = logging.getLogger(__name__)
@@ -62,9 +67,16 @@ class YtDlpService:
 
         return _map_video_info(selected_info, url)
 
-    def download_video(self, url: str, download_dir: Path) -> DownloadResult:
+    def download_video(
+        self,
+        url: str,
+        download_dir: Path,
+        progress_callback: Optional[
+            Callable[[DownloadProgress], None]
+        ] = None,
+    ) -> DownloadResult:
         """Download one video to the configured directory."""
-        options = _build_download_options(download_dir)
+        options = _build_download_options(download_dir, progress_callback)
 
         try:
             with YoutubeDL(options) as ydl:
@@ -96,8 +108,11 @@ class YtDlpService:
         )
 
 
-def _build_download_options(download_dir: Path) -> Dict[str, Any]:
-    return {
+def _build_download_options(
+    download_dir: Path,
+    progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+) -> Dict[str, Any]:
+    options: Dict[str, Any] = {
         "format": _DEFAULT_FORMAT,
         "outtmpl": "%(title)s [%(id)s].%(ext)s",
         "paths": {"home": str(download_dir)},
@@ -113,6 +128,97 @@ def _build_download_options(download_dir: Path) -> Dict[str, Any]:
         "retries": 2,
         "fragment_retries": 2,
     }
+
+    if progress_callback is not None:
+        options["progress_hooks"] = [
+            lambda hook_data: _emit_progress(progress_callback, hook_data)
+        ]
+    return options
+
+
+def _emit_progress(
+    progress_callback: Callable[[DownloadProgress], None],
+    hook_data: Mapping[str, Any],
+) -> None:
+    """Translate yt-dlp's progress hook without logging every update."""
+    try:
+        progress_callback(_map_progress(hook_data))
+    except Exception:
+        # A UI callback failure must not abort an otherwise valid download.
+        logger.exception("Download progress callback failed")
+
+
+def _map_progress(hook_data: Mapping[str, Any]) -> DownloadProgress:
+    raw_status = str(hook_data.get("status") or "").lower()
+    if raw_status == "downloading":
+        status = DownloadStatus.DOWNLOADING
+    elif raw_status == "finished":
+        # yt-dlp reports each stream independently. A separate video/audio
+        # format is not fully complete until the worker receives success.
+        status = DownloadStatus.PARTIAL_FINISHED
+    else:
+        status = DownloadStatus.FAILED
+
+    downloaded_bytes = _optional_nonnegative_int(
+        hook_data.get("downloaded_bytes")
+    )
+    total_bytes = _optional_nonnegative_int(hook_data.get("total_bytes"))
+    total_is_estimate = False
+    if total_bytes is None:
+        total_bytes = _optional_nonnegative_int(
+            hook_data.get("total_bytes_estimate")
+        )
+        total_is_estimate = total_bytes is not None
+
+    percent: Optional[float] = None
+    if downloaded_bytes is not None and total_bytes and total_bytes > 0:
+        percent = max(0.0, min(100.0, downloaded_bytes * 100.0 / total_bytes))
+
+    speed = _nonnegative_float(hook_data.get("speed"))
+    eta = _nonnegative_int(hook_data.get("eta"))
+
+    return DownloadProgress(
+        status=status,
+        percent=percent,
+        downloaded_bytes=downloaded_bytes,
+        total_bytes=total_bytes,
+        total_is_estimate=total_is_estimate,
+        speed=speed,
+        eta=eta,
+    )
+
+
+def _optional_nonnegative_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _nonnegative_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # yt-dlp uses -1 for unknown ETA, which the UI can safely show as zero.
+    return max(0, parsed)
+
+
+def _nonnegative_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, parsed)
 
 
 def _resolve_downloaded_path(

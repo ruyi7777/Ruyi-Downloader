@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QStatusBar,
@@ -21,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.core.download_models import DownloadResult
+from app.core.download_models import DownloadProgress, DownloadResult, DownloadStatus
 from app.core.downloader import VideoDownloader
 from app.core.settings import SettingsManager
 from app.core.video_info import VideoInfo
@@ -163,6 +164,34 @@ class MainWindow(QMainWindow):
         self.download_status.setStyleSheet("color: #175cd3;")
         task_layout.addWidget(self.download_status)
 
+        progress_layout = QFormLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(6)
+        self.download_progress_bar = QProgressBar(task_group)
+        self.download_progress_bar.setObjectName("downloadProgressBar")
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(0)
+        self.download_progress_bar.setFormat("等待下载")
+        self.download_progress_bar.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        progress_layout.addRow("下载进度：", self.download_progress_bar)
+        task_layout.addLayout(progress_layout)
+
+        progress_details_layout = QHBoxLayout()
+        progress_details_layout.setSpacing(18)
+        self.download_speed_value = QLabel("速度：—", task_group)
+        self.download_speed_value.setObjectName("downloadSpeedValue")
+        self.download_downloaded_value = QLabel("已下载：—", task_group)
+        self.download_downloaded_value.setObjectName("downloadDownloadedValue")
+        self.download_eta_value = QLabel("剩余时间：—", task_group)
+        self.download_eta_value.setObjectName("downloadEtaValue")
+        progress_details_layout.addWidget(self.download_speed_value)
+        progress_details_layout.addWidget(self.download_downloaded_value)
+        progress_details_layout.addWidget(self.download_eta_value)
+        progress_details_layout.addStretch()
+        task_layout.addLayout(progress_details_layout)
+
         self.download_button = QPushButton("开始下载", task_group)
         self.download_button.setObjectName("downloadButton")
         self.download_button.setEnabled(True)
@@ -215,12 +244,14 @@ class MainWindow(QMainWindow):
 
         self._is_downloading = True
         self._set_interaction_state("downloading")
-        self._show_download_status("正在下载，请稍候…", error=False)
+        self._reset_download_progress()
+        self._show_download_status("等待下载", error=False)
 
         worker = DownloadWorker(
             self.url_input.text(),
             downloader=self.downloader,
         )
+        worker.signals.progress.connect(self._on_download_progress)
         worker.signals.succeeded.connect(self._on_download_succeeded)
         worker.signals.failed.connect(self._on_download_failed)
         QThreadPool.globalInstance().start(worker)
@@ -287,12 +318,79 @@ class MainWindow(QMainWindow):
             error=True,
         )
 
+    def _reset_download_progress(self) -> None:
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(0)
+        self.download_progress_bar.setFormat("等待下载")
+        self.download_speed_value.setText("速度：—")
+        self.download_downloaded_value.setText("已下载：—")
+        self.download_eta_value.setText("剩余时间：—")
+
+    def _on_download_progress(self, progress: DownloadProgress) -> None:
+        """Update progress widgets in the GUI thread from worker signals."""
+        if not self._is_downloading:
+            return
+
+        if progress.status is DownloadStatus.FAILED:
+            self.download_progress_bar.setRange(0, 100)
+            self.download_progress_bar.setValue(0)
+            self.download_progress_bar.setFormat("下载失败")
+            self.download_speed_value.setText("速度：—")
+            self.download_eta_value.setText("剩余时间：—")
+            self._set_download_progress_status("下载失败", error=True)
+            return
+
+        if progress.status is DownloadStatus.COMPLETED:
+            self._complete_download_progress()
+            return
+
+        self._set_download_progress_status(
+            "下载分段完成，继续处理…"
+            if progress.status is DownloadStatus.PARTIAL_FINISHED
+            else "下载中",
+            error=False,
+        )
+
+        if progress.percent is None:
+            self.download_progress_bar.setRange(0, 0)
+            self.download_progress_bar.setFormat("下载中")
+        else:
+            self.download_progress_bar.setRange(0, 100)
+            self.download_progress_bar.setValue(int(round(progress.percent)))
+            self.download_progress_bar.setFormat("%p%")
+
+        speed_text = (
+            f"{self._format_bytes(progress.speed)}/s"
+            if progress.speed is not None
+            else "—"
+        )
+        self.download_speed_value.setText(f"速度：{speed_text}")
+        self.download_downloaded_value.setText(
+            self._format_downloaded_size(progress)
+        )
+        self.download_eta_value.setText(
+            f"剩余时间：{self._format_eta(progress.eta)}"
+        )
+
+    def _complete_download_progress(self) -> None:
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(100)
+        self.download_progress_bar.setFormat("100%")
+        self.download_speed_value.setText("速度：—")
+        self.download_eta_value.setText("剩余时间：—")
+
+    def _set_download_progress_status(self, message: str, error: bool) -> None:
+        self.download_status.setText(message)
+        color = "#b42318" if error else "#175cd3"
+        self.download_status.setStyleSheet(f"color: {color};")
+
     def _on_download_succeeded(self, result: DownloadResult) -> None:
         if not self._is_downloading:
             return
 
         self._is_downloading = False
         self._set_interaction_state("idle")
+        self._complete_download_progress()
         self._show_download_status(
             f"下载完成：{result.file_name}",
             error=False,
@@ -304,10 +402,70 @@ class MainWindow(QMainWindow):
 
         self._is_downloading = False
         self._set_interaction_state("idle")
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(0)
+        self.download_progress_bar.setFormat("下载失败")
+        self.download_speed_value.setText("速度：—")
+        self.download_downloaded_value.setText("已下载：—")
+        self.download_eta_value.setText("剩余时间：—")
         self._show_download_status(
             self._format_failure("下载失败", user_message),
             error=True,
         )
+
+    @staticmethod
+    def _format_downloaded_size(progress: DownloadProgress) -> str:
+        downloaded = (
+            MainWindow._format_bytes(progress.downloaded_bytes)
+            if progress.downloaded_bytes is not None
+            else "未知"
+        )
+        if progress.total_bytes is None:
+            return f"已下载：{downloaded} / 未知总大小"
+
+        total_prefix = "约 " if progress.total_is_estimate else ""
+        total = f"{total_prefix}{MainWindow._format_bytes(progress.total_bytes)}"
+        return f"已下载：{downloaded} / {total}"
+
+    @staticmethod
+    def _format_bytes(value: Optional[float]) -> str:
+        if value is None or value < 0:
+            return "未知"
+
+        units = ("B", "KB", "MB", "GB", "TB")
+        size = float(value)
+        unit_index = 0
+        while size >= 1024.0 and unit_index < len(units) - 1:
+            size /= 1024.0
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{int(round(size))} {units[unit_index]}"
+        if size < 10:
+            return f"{size:.1f} {units[unit_index]}"
+        return f"{size:.0f} {units[unit_index]}"
+
+    @staticmethod
+    def _format_eta(seconds: Optional[int]) -> str:
+        if seconds is None or seconds < 0:
+            return "—"
+
+        total_seconds = int(seconds)
+        if total_seconds < 60:
+            return f"{total_seconds} 秒"
+        if total_seconds < 3600:
+            minutes, remaining = divmod(total_seconds, 60)
+            if remaining:
+                return f"{minutes} 分 {remaining} 秒"
+            return f"{minutes} 分"
+
+        hours, remaining = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remaining, 60)
+        if minutes and seconds:
+            return f"{hours} 小时 {minutes} 分 {seconds} 秒"
+        if minutes:
+            return f"{hours} 小时 {minutes} 分"
+        return f"{hours} 小时"
 
     @staticmethod
     def _format_failure(prefix: str, message: str) -> str:

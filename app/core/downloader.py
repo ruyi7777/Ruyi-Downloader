@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlsplit
 
-from app.core.download_models import DownloadError, DownloadResult
+from app.core.download_models import DownloadError, DownloadProgress, DownloadResult
 from app.core.settings import SettingsManager
 from app.services.ytdlp_service import YtDlpService
 from app.utils.paths import ensure_directory, get_project_root
@@ -37,7 +37,11 @@ class VideoDownloader:
             path = get_project_root() / path
         return path
 
-    def download(self, url: str) -> DownloadResult:
+    def download(
+        self,
+        url: str,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+    ) -> DownloadResult:
         """Download one URL and return the resulting file information."""
         normalized_url = url.strip()
         target_directory = self.download_path
@@ -64,7 +68,11 @@ class VideoDownloader:
         )
 
         try:
-            result = self.service.download_video(normalized_url, target_directory)
+            result = self.service.download_video(
+                normalized_url,
+                target_directory,
+                progress_callback=progress_callback,
+            )
         except DownloadError as error:
             self._log_failure(normalized_url, error.user_message, error.detail)
             raise
