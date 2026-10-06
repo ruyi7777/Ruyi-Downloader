@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, QThreadPool
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -29,7 +32,7 @@ from app.core.video_info import VideoInfo
 from app.core.video_info_parser import VideoInfoParser
 from app.ui.download_worker import DownloadWorker
 from app.ui.video_info_worker import VideoInfoWorker
-from app.utils.paths import get_config_path, get_log_file
+from app.utils.paths import get_config_path, get_log_file, get_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +49,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.settings = settings or SettingsManager()
-        self.parser = parser or VideoInfoParser()
+        self.parser = parser or VideoInfoParser(settings=self.settings)
         self.downloader = downloader or VideoDownloader(settings=self.settings)
         self._is_parsing = False
         self._is_downloading = False
@@ -99,6 +102,33 @@ class MainWindow(QMainWindow):
         self.parse_button.clicked.connect(self._start_parse)
         url_layout.addRow(self.parse_button)
         root_layout.addWidget(url_group)
+
+        cookie_group = QGroupBox("Cookie 文件", self)
+        cookie_group.setObjectName("cookieGroup")
+        cookie_layout = QFormLayout(cookie_group)
+        cookie_layout.setContentsMargins(14, 12, 14, 12)
+        cookie_layout.setSpacing(10)
+
+        self.cookie_file_value = QLineEdit(cookie_group)
+        self.cookie_file_value.setObjectName("cookieFileValue")
+        self.cookie_file_value.setReadOnly(True)
+        self.cookie_file_value.setPlaceholderText("未配置 Cookie 文件")
+        cookie_layout.addRow("Cookie 文件：", self.cookie_file_value)
+
+        cookie_button_layout = QHBoxLayout()
+        cookie_button_layout.setSpacing(8)
+        self.select_cookie_button = QPushButton("选择 Cookie", cookie_group)
+        self.select_cookie_button.setObjectName("selectCookieButton")
+        self.select_cookie_button.clicked.connect(self._select_cookie_file)
+        self.clear_cookie_button = QPushButton("清除 Cookie", cookie_group)
+        self.clear_cookie_button.setObjectName("clearCookieButton")
+        self.clear_cookie_button.clicked.connect(self._clear_cookie_file)
+        cookie_button_layout.addWidget(self.select_cookie_button)
+        cookie_button_layout.addWidget(self.clear_cookie_button)
+        cookie_button_layout.addStretch()
+        cookie_layout.addRow(cookie_button_layout)
+        self._refresh_cookie_display()
+        root_layout.addWidget(cookie_group)
 
         info_group = QGroupBox("视频信息", self)
         info_group.setObjectName("videoInfoGroup")
@@ -221,6 +251,81 @@ class MainWindow(QMainWindow):
             f"{get_config_path().name} | 日志：{get_log_file().name}"
         )
         status_bar.showMessage(status_message)
+
+    def _refresh_cookie_display(self) -> None:
+        """Show only the configured path; never read Cookie contents."""
+        configured = str(self.settings.get("cookie_file", "") or "").strip()
+        self.clear_cookie_button.setEnabled(bool(configured))
+
+        if not configured:
+            self.cookie_file_value.setText("")
+            self.cookie_file_value.setToolTip("")
+            return
+
+        cookie_path = Path(configured).expanduser()
+        if not cookie_path.is_absolute():
+            cookie_path = get_project_root() / cookie_path
+        if cookie_path.is_file():
+            display_path = str(cookie_path.resolve())
+            self.cookie_file_value.setText(display_path)
+            self.cookie_file_value.setToolTip(display_path)
+            return
+
+        self.cookie_file_value.setText(f"Cookie 文件不存在：{configured}")
+        self.cookie_file_value.setToolTip(configured)
+        logger.warning("Cookie file missing")
+
+    def _select_cookie_file(self) -> None:
+        """Choose a Netscape cookies file and save only its path."""
+        if self._is_parsing or self._is_downloading:
+            return
+
+        start_directory = str(Path.home())
+        configured = str(self.settings.get("cookie_file", "") or "").strip()
+        if configured:
+            current_path = Path(configured).expanduser()
+            if current_path.is_dir():
+                start_directory = str(current_path)
+            elif current_path.parent.is_dir():
+                start_directory = str(current_path.parent)
+
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 Cookie 文件",
+            start_directory,
+            "Netscape Cookie 文件 (*.txt);;所有文件 (*)",
+        )
+        if not selected:
+            return
+
+        selected_path = Path(selected).expanduser()
+        if not selected_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Cookie 文件错误",
+                "Cookie 文件不存在，请重新选择 Cookie 文件。",
+            )
+            self._refresh_cookie_display()
+            return
+
+        self.settings.set(
+            "cookie_file",
+            str(selected_path.resolve()),
+            save=True,
+        )
+        self._refresh_cookie_display()
+        logger.info("Cookie file configured")
+        self.statusBar().showMessage("Cookie 文件已配置")
+
+    def _clear_cookie_file(self) -> None:
+        """Clear only the application setting, never the user's file."""
+        if self._is_parsing or self._is_downloading:
+            return
+
+        self.settings.set("cookie_file", "", save=True)
+        self._refresh_cookie_display()
+        logger.info("Cookie file cleared")
+        self.statusBar().showMessage("Cookie 配置已清除，原文件未删除")
 
     def _start_parse(self) -> None:
         """Start one background parse request without blocking the GUI thread."""

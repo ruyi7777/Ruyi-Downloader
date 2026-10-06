@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlsplit
 
+from app.core.cookie_file import CookieFileError
 from app.core.download_models import DownloadError, DownloadProgress, DownloadResult
+from app.core.platform_policy import resolve_cookie_for_url
 from app.core.settings import SettingsManager
 from app.services.ffmpeg_service import FFmpegLocation, FFmpegService
 from app.services.ytdlp_service import YtDlpService
@@ -49,7 +51,22 @@ class VideoDownloader:
 
         try:
             self._validate_url(normalized_url)
+            cookie_file = resolve_cookie_for_url(
+                self.settings.get("cookie_file", ""),
+                normalized_url,
+            )
             ensure_directory(target_directory)
+        except CookieFileError as error:
+            download_error = DownloadError(
+                error.user_message,
+                error.detail,
+            )
+            self._log_failure(
+                normalized_url,
+                download_error.user_message,
+                download_error.detail,
+            )
+            raise download_error from None
         except DownloadError:
             self._log_failure(normalized_url, None, None)
             raise
@@ -77,6 +94,7 @@ class VideoDownloader:
                 target_directory,
                 progress_callback=progress_callback,
                 ffmpeg_path=ffmpeg_path,
+                cookie_file=cookie_file,
             )
         except DownloadError as error:
             self._log_failure(normalized_url, error.user_message, error.detail)

@@ -17,6 +17,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "avoid_av1": True,
     "output_format": "mp4",
     "ffmpeg_path": "",
+    "cookie_file": "",
 }
 
 

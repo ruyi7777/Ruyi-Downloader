@@ -5,6 +5,9 @@ import logging
 from typing import Optional
 from urllib.parse import urlsplit
 
+from app.core.cookie_file import CookieFileError
+from app.core.platform_policy import resolve_cookie_for_url
+from app.core.settings import SettingsManager
 from app.core.video_info import VideoInfo, VideoParseError
 from app.services.ytdlp_service import YtDlpService
 
@@ -14,8 +17,13 @@ logger = logging.getLogger(__name__)
 class VideoInfoParser:
     """Validate a URL and coordinate parsing through the yt-dlp service."""
 
-    def __init__(self, service: Optional[YtDlpService] = None) -> None:
+    def __init__(
+        self,
+        service: Optional[YtDlpService] = None,
+        settings: Optional[SettingsManager] = None,
+    ) -> None:
         self.service = service or YtDlpService()
+        self.settings = settings or SettingsManager()
 
     def parse(self, url: str) -> VideoInfo:
         """Parse basic video information without downloading any media."""
@@ -23,7 +31,23 @@ class VideoInfoParser:
 
         try:
             self._validate_url(normalized_url)
-            video_info = self.service.extract_video_info(normalized_url)
+            cookie_file = resolve_cookie_for_url(
+                self.settings.get("cookie_file", ""),
+                normalized_url,
+            )
+            video_info = self.service.extract_video_info(
+                normalized_url,
+                cookie_file=cookie_file,
+            )
+        except CookieFileError as error:
+            logger.warning(
+                "Video parsing failed: %s",
+                error.user_message,
+            )
+            raise VideoParseError(
+                error.user_message,
+                error.detail,
+            ) from None
         except VideoParseError as error:
             logger.warning(
                 "Video parsing failed: %s%s",

@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-项目已完成基础架构、视频 URL 信息解析、单个视频下载、下载进度显示和 FFmpeg 自动发现。
+项目已完成基础架构、视频 URL 信息解析、单个视频下载、下载进度显示、FFmpeg 自动发现、Cookie 文件支持和 Cookie 智能使用策略。
 
 当前已具备：
 
@@ -17,6 +17,8 @@
 - 使用 yt-dlp 下载单个视频
 - 使用 yt-dlp progress hook 显示实时下载进度
 - 自动发现 FFmpeg，并将路径传给 yt-dlp
+- 支持选择、保存和清除 Netscape 格式的 Cookie 文件路径
+- 根据平台策略决定是否把已配置的 Cookie 文件交给 yt-dlp
 - 后台线程解析与下载，避免阻塞 GUI 主线程
 - 友好中文错误提示与日志记录
 
@@ -33,7 +35,6 @@
 当前**不包含**以下功能：
 
 - FFmpeg 设置界面
-- Cookie 设置页面
 - 多任务下载
 - 画质选择
 - 暂停与取消
@@ -67,8 +68,9 @@ python main.py
 3. 点击“解析视频”，或直接按 Enter。
 4. 等待后台完成信息提取。
 5. 在“视频信息”区域查看标题、作者、时长和可用格式。
-6. 点击“开始下载”下载当前 URL 对应的单个视频。
-7. 下载时在“下载任务”区域查看实时进度、速度、文件大小和剩余时间。
+6. 如当前平台需要认证，先点击“选择 Cookie”选择 Netscape 格式的 cookies.txt；不需要时可点击“清除 Cookie”。
+7. 点击“开始下载”下载当前 URL 对应的单个视频。
+8. 下载时在“下载任务”区域查看实时进度、速度、文件大小和剩余时间。
 
 解析和下载均在后台线程执行，界面会保持响应。当前一次只处理一个解析或下载任务。解析过程本身不会下载视频文件。
 
@@ -135,7 +137,46 @@ H.264 视频流 + M4A 音频流
 yt-dlp best
 ```
 
-这样可以兼容 TikTok 等平台的完整 MP4，也可以兼容 Bilibili 等平台常见的视频流和音频流分离格式。对于分离格式，yt-dlp 会调用运行环境中可用的 FFmpeg 完成合并；本阶段不增加 FFmpeg 配置界面、独立合并功能或 Cookie 功能，也不实现画质选择。
+这样可以兼容 TikTok 等平台的完整 MP4，也可以兼容 Bilibili 等平台常见的视频流和音频流分离格式。对于分离格式，yt-dlp 会调用运行环境中可用的 FFmpeg 完成合并；本阶段不增加 FFmpeg 配置界面、独立合并功能，也不实现画质选择。
+
+## Cookie 文件支持与使用策略
+
+程序支持通过主窗口选择一个 Netscape HTTP Cookie File（常见文件名 cookies.txt）。配置只保存文件路径到 config/settings.json，不保存 Cookie 内容。
+
+- “选择 Cookie”使用 Windows 文件对话框选择 `.txt` 文件，也可选择所有文件。
+- “清除 Cookie”只清空程序配置，不会删除用户电脑上的 Cookie 文件。
+- 配置的文件不存在时会显示明确的中文提示，程序不会崩溃。
+- Cookie 文件不会复制到项目目录，不会写入 Git、日志、GUI 内容或 README。
+- 当前只支持外部 cookies.txt 文件，不读取 Chrome、Edge、Firefox 的浏览器 Cookie 数据库。
+
+已配置 Cookie 不会自动应用到所有平台。解析或下载前会先根据 URL 识别平台，再由内部 Cookie 策略决定是否使用该文件：
+
+| 平台 | 默认 Cookie 策略 |
+| --- | --- |
+| Douyin | 配置了有效 Cookie 文件时使用 |
+| YouTube | 默认不使用 |
+| Bilibili | 默认不使用 |
+| TikTok | 默认不使用 |
+| X | 默认不使用 |
+| 未知平台 | 默认不使用 |
+
+这样可以避免全局 Cookie 配置影响原本不需要 Cookie 的平台，同时保留后续扩展“自动 / 始终使用 / 从不使用”策略的空间。当前策略仅作为内部规则实现，本阶段不提供策略设置界面。
+
+Cookie 调用链保持现有分层：
+
+```text
+URL
+    ↓
+平台识别与 Cookie Policy
+    ↓
+settings
+    ↓
+VideoInfoParser / VideoDownloader
+    ↓
+YtDlpService
+    ↓
+yt-dlp
+```
 
 ## 代码分层
 
@@ -198,7 +239,7 @@ config/settings.json
 logs/ruyi.log
 ```
 
-日志记录程序启动、配置加载、解析成功、下载开始、下载完成以及解析/下载失败等重要事件。日志中不记录 Cookie 内容、API Key、密码或 Token，下载 URL 的查询参数也不会写入日志。
+日志记录程序启动、配置加载、解析成功、下载开始、下载完成、Cookie 文件配置/清除以及解析/下载失败等重要事件。日志中不记录 Cookie 内容、API Key、密码或 Token，下载 URL 的查询参数也不会写入日志。
 
 ## 当前测试状态
 
@@ -226,8 +267,19 @@ logs/ruyi.log
 - X 视频下载回归
 - YouTube 视频解析回归
 - FFmpeg 缺失模拟与中文错误提示
+- Cookie 路径未配置、文件不存在和目录路径错误处理
+- Cookie 文件选择、路径保存、界面显示与清除配置
+- 清除 Cookie 配置后用户原文件仍然保留
+- 无 Cookie 时 Bilibili、TikTok、X、YouTube 解析回归
+- 无 Cookie 时 Bilibili、TikTok、X 实际下载回归
+- 无效 Cookie 文件的中文错误提示与敏感信息扫描
+- Cookie 已配置时 YouTube、Bilibili、TikTok、X 解析回归
+- Cookie 已配置时 Bilibili、TikTok、X 实际下载回归
+- YouTube 无 Cookie 与已配置 Cookie 两种状态解析对比
+- Cookie 平台策略诊断日志与敏感信息扫描
+- Cookie 策略下 FFmpeg 自动发现、下载进度与 GUI 响应回归
 
-测试中使用指定 Bilibili 视频完成了下载，输出文件同时包含 H.264 视频流和 AAC 音频流，并通过 FFmpeg 解码检查；同时使用 TikTok 视频验证原有下载流程仍然正常。
+测试中使用指定 Bilibili 视频完成了下载，输出文件同时包含 H.264 视频流和 AAC 音频流，并通过 FFmpeg 解码检查；同时使用 TikTok 和 X 视频验证原有下载流程仍然正常。已配置 Cookie 时 YouTube、Bilibili、TikTok、X 均可正常解析，Bilibili、TikTok、X 也可正常下载，说明 Cookie 不会再被强制应用到这些平台。Douyin 在无 Cookie 时会显示已有的登录/Cookie 中文提示；使用本机已配置的 Cookie 文件时，平台识别和 Cookie 传递均正常，但当前网络环境下 yt-dlp 仍返回 HTTP 403 / Fresh cookies 提示，因此本阶段不声称抖音下载成功。本阶段没有修改代理功能。
 
 ## 下一步计划
 
@@ -235,10 +287,9 @@ logs/ruyi.log
 
 1. 下载目录设置页面
 2. FFmpeg 设置页面
-3. Cookie 支持
-4. 重复下载检测
-5. 多任务管理
-6. 设置页面
-7. 错误处理完善
-8. 自动化测试
-9. PyInstaller 打包
+3. 重复下载检测
+4. 多任务管理
+5. 设置页面
+6. 错误处理完善
+7. 自动化测试
+8. PyInstaller 打包

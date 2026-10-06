@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -20,6 +22,78 @@ from app.core.video_info import VideoFormatInfo, VideoInfo, VideoParseError
 logger = logging.getLogger(__name__)
 
 _URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_COOKIE_FORMAT_MESSAGE = (
+    "Cookie 文件格式无效，请选择 Netscape 格式的 cookies.txt。"
+)
+_COOKIE_MISSING_MESSAGE = (
+    "Cookie 文件不存在，请重新选择 Cookie 文件。"
+)
+
+
+class _CookieSafeStderr:
+    """Forward stderr while dropping yt-dlp's raw Cookie line warning."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, message: str) -> int:
+        if "skipping cookie file entry" in message:
+            return len(message)
+        return self._stream.write(message)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        if name in {"buffer", "raw"}:
+            # Do not let yt-dlp bypass write() through the wrapped stream.
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+@contextmanager
+def _cookie_safe_stderr():
+    """Prevent invalid Cookie lines from leaking through yt-dlp's stderr.
+
+    This guard is intentionally process-local. The application permits only
+    one parse or download worker at a time, so no concurrent yt-dlp operation
+    can observe the temporary stderr replacement.
+    """
+    original_stderr = sys.stderr
+    if original_stderr is None:
+        yield
+        return
+    sys.stderr = _CookieSafeStderr(original_stderr)
+    try:
+        yield
+    finally:
+        sys.stderr = original_stderr
+
+
+class _SafeYtDlpLogger:
+    """Route yt-dlp messages without exposing Cookie file contents."""
+
+    @staticmethod
+    def debug(_message: str) -> None:
+        # Raw debug messages may echo sensitive file data.
+        return None
+
+    @staticmethod
+    def info(_message: str) -> None:
+        return None
+
+    @staticmethod
+    def warning(message: str) -> None:
+        if _is_cookie_file_error(message.lower()):
+            return
+        logger.warning("yt-dlp warning: %s", _sanitize_detail(message))
+
+    @staticmethod
+    def error(message: str) -> None:
+        if _is_cookie_file_error(message.lower()):
+            return
+        logger.warning("yt-dlp error: %s", _sanitize_detail(message))
+
 
 _INFO_OPTIONS: Dict[str, Any] = {
     "skip_download": True,
@@ -28,6 +102,7 @@ _INFO_OPTIONS: Dict[str, Any] = {
     "no_warnings": True,
     "socket_timeout": 15,
     "retries": 1,
+    "logger": _SafeYtDlpLogger(),
 }
 
 # Prefer a complete MP4 file first, then fall back to separate video/audio
@@ -47,15 +122,31 @@ _DEFAULT_FORMAT = (
 class YtDlpService:
     """Access yt-dlp metadata and download capabilities through its Python API."""
 
-    def extract_video_info(self, url: str) -> VideoInfo:
+    def extract_video_info(
+        self,
+        url: str,
+        cookie_file: Optional[Path] = None,
+    ) -> VideoInfo:
         """Return normalized metadata without invoking media download."""
+        options = dict(_INFO_OPTIONS)
+        _apply_cookie_option(options, cookie_file)
+
         try:
-            with YoutubeDL(dict(_INFO_OPTIONS)) as ydl:
+            with _cookie_safe_stderr(), YoutubeDL(options) as ydl:
                 raw_info = ydl.extract_info(url, download=False)
         except VideoParseError:
             raise
         except Exception as error:
-            detail = _sanitize_detail(f"{type(error).__name__}: {error}")
+            raw_detail = f"{type(error).__name__}: {error}"
+            if _is_cookie_file_error(raw_detail.lower()):
+                logger.warning(
+                    "yt-dlp extraction failed: Cookie file load failed"
+                )
+                raise VideoParseError(
+                    _cookie_failure_message(raw_detail.lower()),
+                    "Cookie file load failed",
+                ) from None
+            detail = _sanitize_detail(raw_detail)
             logger.warning("yt-dlp extraction failed: %s", detail)
             raise VideoParseError(_friendly_parse_error(detail), detail) from error
 
@@ -75,16 +166,18 @@ class YtDlpService:
             Callable[[DownloadProgress], None]
         ] = None,
         ffmpeg_path: Optional[Path] = None,
+        cookie_file: Optional[Path] = None,
     ) -> DownloadResult:
         """Download one video to the configured directory."""
         options = _build_download_options(
             download_dir,
             progress_callback,
             ffmpeg_path,
+            cookie_file,
         )
 
         try:
-            with YoutubeDL(options) as ydl:
+            with _cookie_safe_stderr(), YoutubeDL(options) as ydl:
                 raw_info = ydl.extract_info(url, download=True)
                 selected_info = _select_video_entry(raw_info)
                 if selected_info is None:
@@ -100,7 +193,16 @@ class YtDlpService:
         except DownloadError:
             raise
         except Exception as error:
-            detail = _sanitize_detail(f"{type(error).__name__}: {error}")
+            raw_detail = f"{type(error).__name__}: {error}"
+            if _is_cookie_file_error(raw_detail.lower()):
+                logger.warning(
+                    "yt-dlp download failed: Cookie file load failed"
+                )
+                raise DownloadError(
+                    _cookie_failure_message(raw_detail.lower()),
+                    "Cookie file load failed",
+                ) from None
+            detail = _sanitize_detail(raw_detail)
             logger.warning("yt-dlp download failed: %s", detail)
             raise DownloadError(_friendly_download_error(detail), detail) from error
 
@@ -117,6 +219,7 @@ def _build_download_options(
     download_dir: Path,
     progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
     ffmpeg_path: Optional[Path] = None,
+    cookie_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     options: Dict[str, Any] = {
         "format": _DEFAULT_FORMAT,
@@ -133,16 +236,28 @@ def _build_download_options(
         "socket_timeout": 15,
         "retries": 2,
         "fragment_retries": 2,
+        "logger": _SafeYtDlpLogger(),
     }
 
     if ffmpeg_path is not None:
         options["ffmpeg_location"] = str(ffmpeg_path)
+
+    _apply_cookie_option(options, cookie_file)
 
     if progress_callback is not None:
         options["progress_hooks"] = [
             lambda hook_data: _emit_progress(progress_callback, hook_data)
         ]
     return options
+
+
+def _apply_cookie_option(
+    options: Dict[str, Any],
+    cookie_file: Optional[Path],
+) -> None:
+    """Let yt-dlp read a Netscape cookie file without exposing its values."""
+    if cookie_file is not None:
+        options["cookiefile"] = str(cookie_file)
 
 
 def _emit_progress(
@@ -368,6 +483,9 @@ def _map_format(raw_format: Mapping[str, Any]) -> VideoFormatInfo:
 def _friendly_parse_error(detail: str) -> str:
     message = detail.lower()
 
+    if _is_cookie_file_error(message):
+        return _cookie_failure_message(message)
+
     if any(
         marker in message
         for marker in (
@@ -399,6 +517,9 @@ def _friendly_parse_error(detail: str) -> str:
 
 def _friendly_download_error(detail: str) -> str:
     message = detail.lower()
+
+    if _is_cookie_file_error(message):
+        return _cookie_failure_message(message)
 
     if _is_ffmpeg_missing(message):
         return "未找到 FFmpeg，请安装 FFmpeg 或在设置中配置 FFmpeg 路径。"
@@ -453,6 +574,31 @@ def _friendly_download_error(detail: str) -> str:
         return "视频不存在、已下架或无法访问"
 
     return "下载失败，请检查链接和网络后重试"
+
+
+def _is_cookie_file_error(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "cookie file",
+            "cookies file",
+            "unable to load cookies",
+            "failed to load cookies",
+            "cookies could not be loaded",
+            "cannot load cookies",
+            "netscape http cookie file",
+            "http.cookiejar",
+        )
+    )
+
+
+def _cookie_failure_message(message: str) -> str:
+    if any(
+        marker in message
+        for marker in ("not found", "does not exist", "no such file")
+    ):
+        return _COOKIE_MISSING_MESSAGE
+    return _COOKIE_FORMAT_MESSAGE
 
 
 def _is_ffmpeg_missing(message: str) -> bool:

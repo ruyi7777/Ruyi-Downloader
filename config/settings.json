@@ -4,5 +4,6 @@
     "concurrent_tasks": 2,
     "avoid_av1": true,
     "output_format": "mp4",
-    "ffmpeg_path": ""
+    "ffmpeg_path": "",
+    "cookie_file": ""
 }

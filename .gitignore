@@ -24,3 +24,8 @@ config/*.local.json
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Cookie files
+cookies.txt
+cookies*.txt
+*.cookies.txt
