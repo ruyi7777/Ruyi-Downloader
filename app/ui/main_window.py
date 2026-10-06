@@ -1,4 +1,4 @@
-"""Main window for Ruyi Video Downloader URL parsing."""
+"""Main window for Ruyi Video Downloader URL parsing and single download."""
 from __future__ import annotations
 
 import logging
@@ -21,9 +21,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.core.download_models import DownloadResult
+from app.core.downloader import VideoDownloader
 from app.core.settings import SettingsManager
 from app.core.video_info import VideoInfo
 from app.core.video_info_parser import VideoInfoParser
+from app.ui.download_worker import DownloadWorker
 from app.ui.video_info_worker import VideoInfoWorker
 from app.utils.paths import get_config_path, get_log_file
 
@@ -31,21 +34,24 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """Main window containing URL parsing without download functionality."""
+    """Main window containing URL parsing and single-video download."""
 
     def __init__(
         self,
         settings: Optional[SettingsManager] = None,
         parent=None,
         parser: Optional[VideoInfoParser] = None,
+        downloader: Optional[VideoDownloader] = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings or SettingsManager()
         self.parser = parser or VideoInfoParser()
+        self.downloader = downloader or VideoDownloader(settings=self.settings)
         self._is_parsing = False
+        self._is_downloading = False
 
         self.setWindowTitle("如意视频下载器")
-        self.setMinimumSize(880, 700)
+        self.setMinimumSize(880, 760)
         self.setObjectName("mainWindow")
 
         self._build_ui()
@@ -54,7 +60,7 @@ class MainWindow(QMainWindow):
         logger.info("Main window created")
 
     def _build_ui(self) -> None:
-        """Construct the URL parsing UI while keeping download disabled."""
+        """Construct the parsing and single-video download UI."""
         central_widget = QWidget(self)
         central_widget.setObjectName("centralWidget")
         root_layout = QVBoxLayout(central_widget)
@@ -68,7 +74,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_label)
         header_layout.addStretch()
 
-        version_label = QLabel("Ruyi Video Downloader · URL 信息解析", self)
+        version_label = QLabel("Ruyi Video Downloader · URL 解析与单个视频下载", self)
         version_label.setObjectName("versionLabel")
         header_layout.addWidget(version_label)
         root_layout.addLayout(header_layout)
@@ -136,15 +142,32 @@ class MainWindow(QMainWindow):
         task_layout.setContentsMargins(14, 12, 14, 12)
         task_layout.setSpacing(8)
 
-        task_hint = QLabel("当前仅支持信息解析，下载功能将在后续阶段启用", task_group)
-        task_hint.setObjectName("taskHint")
-        task_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        task_layout.addWidget(task_hint)
+        path_layout = QHBoxLayout()
+        path_layout.setSpacing(8)
+        path_layout.addWidget(QLabel("下载目录：", task_group))
+        self.download_path_value = QLabel(
+            str(self.downloader.download_path),
+            task_group,
+        )
+        self.download_path_value.setObjectName("downloadPathValue")
+        self.download_path_value.setWordWrap(True)
+        self.download_path_value.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        path_layout.addWidget(self.download_path_value, 1)
+        task_layout.addLayout(path_layout)
+
+        self.download_status = QLabel("等待开始下载", task_group)
+        self.download_status.setObjectName("downloadStatus")
+        self.download_status.setWordWrap(True)
+        self.download_status.setStyleSheet("color: #175cd3;")
+        task_layout.addWidget(self.download_status)
 
         self.download_button = QPushButton("开始下载", task_group)
         self.download_button.setObjectName("downloadButton")
-        self.download_button.setEnabled(False)
-        self.download_button.setToolTip("下载功能将在后续阶段实现")
+        self.download_button.setEnabled(True)
+        self.download_button.setToolTip("下载当前输入的单个视频，不进行格式合并")
+        self.download_button.clicked.connect(self._start_download)
         task_layout.addWidget(self.download_button)
         root_layout.addWidget(task_group)
 
@@ -172,11 +195,11 @@ class MainWindow(QMainWindow):
 
     def _start_parse(self) -> None:
         """Start one background parse request without blocking the GUI thread."""
-        if self._is_parsing:
+        if self._is_parsing or self._is_downloading:
             return
 
         self._is_parsing = True
-        self._set_parsing_state(True)
+        self._set_interaction_state("parsing")
         self._reset_video_info()
         self._show_parse_status("正在解析视频信息，请稍候…", error=False)
 
@@ -185,10 +208,38 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(self._on_parse_failed)
         QThreadPool.globalInstance().start(worker)
 
-    def _set_parsing_state(self, parsing: bool) -> None:
-        self.parse_button.setEnabled(not parsing)
-        self.url_input.setEnabled(not parsing)
-        self.parse_button.setText("正在解析…" if parsing else "解析视频")
+    def _start_download(self) -> None:
+        """Start one background download without blocking the GUI thread."""
+        if self._is_parsing or self._is_downloading:
+            return
+
+        self._is_downloading = True
+        self._set_interaction_state("downloading")
+        self._show_download_status("正在下载，请稍候…", error=False)
+
+        worker = DownloadWorker(
+            self.url_input.text(),
+            downloader=self.downloader,
+        )
+        worker.signals.succeeded.connect(self._on_download_succeeded)
+        worker.signals.failed.connect(self._on_download_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _set_interaction_state(self, state: str) -> None:
+        busy = state != "idle"
+        self.parse_button.setEnabled(not busy)
+        self.download_button.setEnabled(not busy)
+        self.url_input.setEnabled(not busy)
+
+        if state == "parsing":
+            self.parse_button.setText("正在解析…")
+            self.download_button.setText("开始下载")
+        elif state == "downloading":
+            self.parse_button.setText("解析视频")
+            self.download_button.setText("正在下载…")
+        else:
+            self.parse_button.setText("解析视频")
+            self.download_button.setText("开始下载")
 
     def _reset_video_info(self) -> None:
         for label in (
@@ -207,7 +258,7 @@ class MainWindow(QMainWindow):
             return
 
         self._is_parsing = False
-        self._set_parsing_state(False)
+        self._set_interaction_state("idle")
 
         self.id_value.setText(video_info.video_id)
         self.title_value.setText(video_info.title)
@@ -230,8 +281,45 @@ class MainWindow(QMainWindow):
             return
 
         self._is_parsing = False
-        self._set_parsing_state(False)
-        self._show_parse_status(f"解析失败：{user_message}", error=True)
+        self._set_interaction_state("idle")
+        self._show_parse_status(
+            self._format_failure("解析失败", user_message),
+            error=True,
+        )
+
+    def _on_download_succeeded(self, result: DownloadResult) -> None:
+        if not self._is_downloading:
+            return
+
+        self._is_downloading = False
+        self._set_interaction_state("idle")
+        self._show_download_status(
+            f"下载完成：{result.file_name}",
+            error=False,
+        )
+
+    def _on_download_failed(self, user_message: str, _detail: str) -> None:
+        if not self._is_downloading:
+            return
+
+        self._is_downloading = False
+        self._set_interaction_state("idle")
+        self._show_download_status(
+            self._format_failure("下载失败", user_message),
+            error=True,
+        )
+
+    @staticmethod
+    def _format_failure(prefix: str, message: str) -> str:
+        if message.startswith(prefix):
+            return message
+        return f"{prefix}：{message}"
+
+    def _show_download_status(self, message: str, error: bool) -> None:
+        self.download_status.setText(message)
+        self.statusBar().showMessage(message)
+        color = "#b42318" if error else "#175cd3"
+        self.download_status.setStyleSheet(f"color: {color};")
 
     def _show_parse_status(self, message: str, error: bool) -> None:
         self.parse_status.setText(message)
@@ -247,6 +335,6 @@ class MainWindow(QMainWindow):
             return "未知"
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
-        """Log window closure without waiting for background parsing."""
+        """Log window closure without waiting for background workers."""
         logger.info("Main window closed")
         super().closeEvent(event)

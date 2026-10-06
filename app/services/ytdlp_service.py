@@ -1,20 +1,22 @@
-"""yt-dlp information extraction adapter."""
+"""yt-dlp information extraction and download adapter."""
 from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
 
+from app.core.download_models import DownloadError, DownloadResult
 from app.core.video_info import VideoFormatInfo, VideoInfo, VideoParseError
 
 logger = logging.getLogger(__name__)
 
 _URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
-_YDL_OPTIONS: Dict[str, Any] = {
+_INFO_OPTIONS: Dict[str, Any] = {
     "skip_download": True,
     "noplaylist": True,
     "quiet": True,
@@ -23,21 +25,34 @@ _YDL_OPTIONS: Dict[str, Any] = {
     "retries": 1,
 }
 
+# Prefer a complete MP4 file first, then fall back to separate video/audio
+# streams. Bilibili commonly exposes only DASH video-only and audio-only
+# formats, so the fallback is required for normal non-member downloads.
+_DEFAULT_FORMAT = (
+    "best[ext=mp4][vcodec^=avc1]/"
+    "best[ext=mp4]/"
+    "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[ext=mp4]+bestaudio/"
+    "bestvideo+bestaudio/"
+    "best"
+)
+
 
 class YtDlpService:
-    """Extract video metadata using the official yt-dlp Python API."""
+    """Access yt-dlp metadata and download capabilities through its Python API."""
 
     def extract_video_info(self, url: str) -> VideoInfo:
         """Return normalized metadata without invoking media download."""
         try:
-            with YoutubeDL(dict(_YDL_OPTIONS)) as ydl:
+            with YoutubeDL(dict(_INFO_OPTIONS)) as ydl:
                 raw_info = ydl.extract_info(url, download=False)
         except VideoParseError:
             raise
         except Exception as error:
             detail = _sanitize_detail(f"{type(error).__name__}: {error}")
             logger.warning("yt-dlp extraction failed: %s", detail)
-            raise VideoParseError(_friendly_error(detail), detail) from error
+            raise VideoParseError(_friendly_parse_error(detail), detail) from error
 
         selected_info = _select_video_entry(raw_info)
         if selected_info is None:
@@ -46,6 +61,100 @@ class YtDlpService:
             raise VideoParseError("没有找到可解析的视频信息", detail)
 
         return _map_video_info(selected_info, url)
+
+    def download_video(self, url: str, download_dir: Path) -> DownloadResult:
+        """Download one video to the configured directory."""
+        options = _build_download_options(download_dir)
+
+        try:
+            with YoutubeDL(options) as ydl:
+                raw_info = ydl.extract_info(url, download=True)
+                selected_info = _select_video_entry(raw_info)
+                if selected_info is None:
+                    detail = "yt-dlp returned no downloadable video entry"
+                    logger.warning("yt-dlp download failed: %s", detail)
+                    raise DownloadError("没有找到可下载的视频信息", detail)
+
+                file_path = _resolve_downloaded_path(
+                    ydl,
+                    selected_info,
+                    download_dir,
+                )
+        except DownloadError:
+            raise
+        except Exception as error:
+            detail = _sanitize_detail(f"{type(error).__name__}: {error}")
+            logger.warning("yt-dlp download failed: %s", detail)
+            raise DownloadError(_friendly_download_error(detail), detail) from error
+
+        video_id = str(selected_info.get("id") or "未知")
+        title = str(selected_info.get("title") or file_path.stem)
+        return DownloadResult(
+            video_id=video_id,
+            title=title,
+            file_path=file_path,
+        )
+
+
+def _build_download_options(download_dir: Path) -> Dict[str, Any]:
+    return {
+        "format": _DEFAULT_FORMAT,
+        "outtmpl": "%(title)s [%(id)s].%(ext)s",
+        "paths": {"home": str(download_dir)},
+        "noplaylist": True,
+        "skip_download": False,
+        "continuedl": True,
+        "concurrent_fragment_downloads": 1,
+        "windowsfilenames": True,
+        "noprogress": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 2,
+    }
+
+
+def _resolve_downloaded_path(
+    ydl: YoutubeDL,
+    raw_info: Mapping[str, Any],
+    download_dir: Path,
+) -> Path:
+    candidates: List[Any] = []
+
+    requested_downloads = raw_info.get("requested_downloads")
+    if isinstance(requested_downloads, (list, tuple)):
+        for requested in requested_downloads:
+            if isinstance(requested, Mapping):
+                candidates.extend(
+                    (
+                        requested.get("filepath"),
+                        requested.get("_filename"),
+                        requested.get("filename"),
+                    )
+                )
+
+    candidates.extend(
+        (
+            raw_info.get("filepath"),
+            raw_info.get("_filename"),
+            raw_info.get("filename"),
+            ydl.prepare_filename(raw_info),
+        )
+    )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        file_path = Path(candidate)
+        if not file_path.is_absolute():
+            file_path = download_dir / file_path
+        if file_path.is_file():
+            return file_path.resolve()
+
+    detail = "yt-dlp completed without a readable output file"
+    logger.warning("yt-dlp download failed: %s", detail)
+    raise DownloadError("下载完成，但未找到输出文件", detail)
 
 
 def _select_video_entry(raw_info: Any) -> Optional[Mapping[str, Any]]:
@@ -141,7 +250,7 @@ def _map_format(raw_format: Mapping[str, Any]) -> VideoFormatInfo:
     )
 
 
-def _friendly_error(detail: str) -> str:
+def _friendly_parse_error(detail: str) -> str:
     message = detail.lower()
 
     if any(
@@ -155,7 +264,81 @@ def _friendly_error(detail: str) -> str:
     ):
         return "暂不支持此链接，请检查 URL 是否正确"
 
+    if _requires_login(message):
+        return "该视频可能需要登录或 Cookie 才能解析"
+
+    if _is_region_restricted(message):
+        return "该视频可能受地区限制，暂时无法解析"
+
+    if _is_format_unavailable(message):
+        return "没有找到当前可用的视频格式，请更换视频或稍后重试"
+
+    if _is_unavailable(message):
+        return "视频不存在、已下架或无法访问"
+
+    if _is_network_error(message):
+        return "网络连接失败，请检查网络后重试"
+
+    return "解析失败，请检查链接后重试"
+
+
+def _friendly_download_error(detail: str) -> str:
+    message = detail.lower()
+
+    if "ffmpeg" in message or "ffprobe" in message:
+        return "当前格式需要 FFmpeg 才能完成，请确认 FFmpeg 可用"
+
     if any(
+        marker in message
+        for marker in (
+            "no space left",
+            "disk full",
+            "not enough disk space",
+            "there is not enough space",
+        )
+    ):
+        return "磁盘空间不足，请清理后重试"
+
+    if any(
+        marker in message
+        for marker in (
+            "permission denied",
+            "access is denied",
+            "winerror 5",
+            "read-only file system",
+        )
+    ):
+        return "没有权限写入下载目录，请检查目录权限"
+
+    if _requires_login(message):
+        return "该视频可能需要登录或 Cookie 才能下载"
+
+    if _is_region_restricted(message):
+        return "该视频可能受地区限制，暂时无法下载"
+
+    if _is_format_unavailable(message):
+        return "没有找到当前可用的视频格式，请更换视频或稍后重试"
+
+    if _is_unavailable(message):
+        return "视频不存在、已下架或无法访问"
+
+    if any(
+        marker in message
+        for marker in ("http error 404", "http error 410")
+    ):
+        return "下载地址无效或视频不存在"
+
+    if _is_network_error(message):
+        return "网络连接失败，请检查网络后重试"
+
+    if "video unavailable" in message:
+        return "视频不存在、已下架或无法访问"
+
+    return "下载失败，请检查链接和网络后重试"
+
+
+def _requires_login(message: str) -> bool:
+    return any(
         marker in message
         for marker in (
             "sign in",
@@ -163,17 +346,32 @@ def _friendly_error(detail: str) -> str:
             "cookies",
             "authentication",
             "confirm your age",
+            "not a bot",
         )
-    ):
-        return "该视频可能需要登录或 Cookie 才能解析"
+    )
 
-    if any(
+
+def _is_format_unavailable(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "requested format is not available",
+            "requested formats are not available",
+            "format is not available",
+            "no video formats found",
+        )
+    )
+
+
+def _is_region_restricted(message: str) -> bool:
+    return any(
         marker in message
         for marker in ("country", "region", "geo restricted", "not available in your")
-    ):
-        return "该视频可能受地区限制，暂时无法解析"
+    )
 
-    if any(
+
+def _is_unavailable(message: str) -> bool:
+    return any(
         marker in message
         for marker in (
             "video unavailable",
@@ -182,13 +380,15 @@ def _friendly_error(detail: str) -> str:
             "video has been deleted",
             "not available",
         )
-    ):
-        return "视频不存在、已下架或无法访问"
+    )
 
-    if any(
+
+def _is_network_error(message: str) -> bool:
+    return any(
         marker in message
         for marker in (
             "unable to download webpage",
+            "unable to download video data",
             "network is unreachable",
             "connection refused",
             "connection reset",
@@ -197,10 +397,7 @@ def _friendly_error(detail: str) -> str:
             "getaddrinfo failed",
             "urlopen error",
         )
-    ):
-        return "网络连接失败，请检查网络后重试"
-
-    return "解析失败，请检查链接后重试"
+    )
 
 
 def _sanitize_detail(detail: str) -> str:
