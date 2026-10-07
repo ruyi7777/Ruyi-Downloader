@@ -7,11 +7,14 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, QThreadPool
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -19,19 +22,24 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.core.download_models import DownloadProgress, DownloadResult, DownloadStatus
 from app.core.downloader import VideoDownloader
+from app.core.platform_policy import detect_platform
 from app.core.settings import SettingsManager
+from app.core.url_extractor import extract_http_urls
 from app.core.video_info import VideoInfo
 from app.core.video_info_parser import VideoInfoParser
 from app.ui.download_worker import DownloadWorker
-from app.ui.video_info_worker import VideoInfoWorker
+from app.ui.video_info_worker import VideoInfoBatchWorker
 from app.utils.paths import get_config_path, get_log_file, get_project_root
 
 logger = logging.getLogger(__name__)
@@ -53,6 +61,9 @@ class MainWindow(QMainWindow):
         self.downloader = downloader or VideoDownloader(settings=self.settings)
         self._is_parsing = False
         self._is_downloading = False
+        self._parse_urls: list[str] = []
+        self._parse_results: dict[int, VideoInfo] = {}
+        self._parse_failure_messages: dict[int, str] = {}
 
         self.setWindowTitle("如意视频下载器")
         self.setMinimumSize(880, 760)
@@ -89,16 +100,21 @@ class MainWindow(QMainWindow):
         url_layout.setContentsMargins(14, 12, 14, 12)
         url_layout.setSpacing(10)
 
-        self.url_input = QLineEdit(url_group)
+        self.url_input = QPlainTextEdit(url_group)
         self.url_input.setObjectName("urlInput")
-        self.url_input.setPlaceholderText("https://...")
-        self.url_input.setClearButtonEnabled(True)
-        self.url_input.returnPressed.connect(self._start_parse)
-        url_layout.addRow("视频链接：", self.url_input)
+        self.url_input.setPlaceholderText(
+            "可粘贴任意文字，并自动提取其中的一个或多个 HTTP/HTTPS 链接…"
+        )
+        self.url_input.setTabChangesFocus(True)
+        self.url_input.setMinimumHeight(72)
+        self.url_input.setMaximumHeight(120)
+        url_layout.addRow("包含链接的文本：", self.url_input)
 
         self.parse_button = QPushButton("解析视频", url_group)
         self.parse_button.setObjectName("parseButton")
-        self.parse_button.setToolTip("获取视频基本信息，不下载任何文件")
+        self.parse_button.setToolTip(
+            "自动提取链接并逐个获取视频基本信息，不下载任何文件"
+        )
         self.parse_button.clicked.connect(self._start_parse)
         url_layout.addRow(self.parse_button)
         root_layout.addWidget(url_group)
@@ -136,10 +152,38 @@ class MainWindow(QMainWindow):
         info_layout.setContentsMargins(14, 12, 14, 12)
         info_layout.setSpacing(8)
 
-        self.parse_status = QLabel("等待输入视频链接", info_group)
+        self.parse_status = QLabel("等待输入包含链接的文本", info_group)
         self.parse_status.setObjectName("parseStatus")
         self.parse_status.setWordWrap(True)
         info_layout.addRow("解析状态：", self.parse_status)
+
+        result_headers = ("序号", "状态", "平台", "标题", "作者/频道", "时长", "URL")
+        self.parse_results_table = QTableWidget(0, len(result_headers), info_group)
+        self.parse_results_table.setObjectName("parseResultsTable")
+        self.parse_results_table.setHorizontalHeaderLabels(result_headers)
+        self.parse_results_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.parse_results_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.parse_results_table.setAlternatingRowColors(True)
+        self.parse_results_table.verticalHeader().setVisible(False)
+        self.parse_results_table.setMinimumHeight(150)
+        self.parse_results_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        header = self.parse_results_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        self.parse_results_table.setColumnWidth(0, 52)
+        self.parse_results_table.setColumnWidth(1, 170)
+        self.parse_results_table.setColumnWidth(2, 95)
+        self.parse_results_table.setColumnWidth(3, 240)
+        self.parse_results_table.setColumnWidth(4, 140)
+        self.parse_results_table.setColumnWidth(5, 85)
+        info_layout.addRow("解析结果：", self.parse_results_table)
 
         self.id_value = self._create_info_label(info_group, "videoIdValue")
         self.title_value = self._create_info_label(info_group, "videoTitleValue")
@@ -231,7 +275,16 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(task_group)
 
         root_layout.addStretch()
-        self.setCentralWidget(central_widget)
+
+        # The full content has a larger minimum height than a normal window.
+        # A scroll area keeps every group in layout order instead of allowing
+        # the layout to compress child widgets until they overlap.
+        scroll_area = QScrollArea(self)
+        scroll_area.setObjectName("contentScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidget(central_widget)
+        self.setCentralWidget(scroll_area)
 
     @staticmethod
     def _create_info_label(parent: QWidget, object_name: str) -> QLabel:
@@ -328,23 +381,55 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Cookie 配置已清除，原文件未删除")
 
     def _start_parse(self) -> None:
-        """Start one background parse request without blocking the GUI thread."""
+        """Extract URLs and start sequential background parsing."""
         if self._is_parsing or self._is_downloading:
             return
 
+        urls = extract_http_urls(self.url_input.toPlainText())
+        if not urls:
+            self._show_parse_status(
+                "未找到有效的 HTTP/HTTPS 链接，请检查输入内容",
+                error=True,
+            )
+            return
+
+        # Keep the input as the normalized URL list so the next action sees
+        # exactly the URLs that were extracted and de-duplicated.
+        self.url_input.setPlainText("\n".join(urls))
+        self._parse_urls = urls
         self._is_parsing = True
         self._set_interaction_state("parsing")
         self._reset_video_info()
-        self._show_parse_status("正在解析视频信息，请稍候…", error=False)
+        self._prepare_parse_results(urls)
+        self._show_parse_status(
+            f"共提取 {len(urls)} 个链接，开始逐个解析…",
+            error=False,
+        )
 
-        worker = VideoInfoWorker(self.url_input.text(), parser=self.parser)
+        worker = VideoInfoBatchWorker(urls, parser=self.parser)
+        worker.signals.started.connect(self._on_parse_started)
         worker.signals.succeeded.connect(self._on_parse_succeeded)
         worker.signals.failed.connect(self._on_parse_failed)
+        worker.signals.finished.connect(self._on_parse_finished)
         QThreadPool.globalInstance().start(worker)
 
     def _start_download(self) -> None:
         """Start one background download without blocking the GUI thread."""
         if self._is_parsing or self._is_downloading:
+            return
+
+        urls = extract_http_urls(self.url_input.toPlainText())
+        if not urls:
+            self._show_download_status(
+                "未找到有效的 HTTP/HTTPS 链接，请检查输入内容",
+                error=True,
+            )
+            return
+        if len(urls) > 1:
+            self._show_download_status(
+                "当前下载功能一次只支持一个视频，请只保留一个链接",
+                error=True,
+            )
             return
 
         self._is_downloading = True
@@ -353,7 +438,7 @@ class MainWindow(QMainWindow):
         self._show_download_status("等待下载", error=False)
 
         worker = DownloadWorker(
-            self.url_input.text(),
+            urls[0],
             downloader=self.downloader,
         )
         worker.signals.progress.connect(self._on_download_progress)
@@ -377,6 +462,40 @@ class MainWindow(QMainWindow):
             self.parse_button.setText("解析视频")
             self.download_button.setText("开始下载")
 
+    def _prepare_parse_results(self, urls: list[str]) -> None:
+        """Create one waiting row for each extracted URL in input order."""
+        self._parse_results = {}
+        self._parse_failure_messages = {}
+        table = self.parse_results_table
+        table.setRowCount(0)
+
+        for index, url in enumerate(urls):
+            table.insertRow(index)
+            values = (
+                str(index + 1),
+                "等待",
+                self._platform_display(url),
+                "—",
+                "—",
+                "—",
+                url,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 6:
+                    item.setToolTip(url)
+                table.setItem(index, column, item)
+            self._set_current_result_status(index, "等待", "#667085")
+
+        table.resizeRowsToContents()
+
+    def _set_current_result_status(self, index: int, status: str, color: str) -> None:
+        item = self.parse_results_table.item(index, 1)
+        if item is None:
+            return
+        item.setText(status)
+        item.setForeground(QColor(color))
+
     def _reset_video_info(self) -> None:
         for label in (
             self.id_value,
@@ -389,13 +508,79 @@ class MainWindow(QMainWindow):
             label.setText("—")
         self.formats_view.clear()
 
-    def _on_parse_succeeded(self, video_info: VideoInfo) -> None:
+    def _on_parse_started(self, index: int) -> None:
+        if not self._is_parsing:
+            return
+
+        self._set_current_result_status(index, "解析中", "#175cd3")
+        if len(self._parse_urls) == 1:
+            message = "正在解析视频信息，请稍候…"
+        else:
+            message = (
+                f"正在解析第 {index + 1} / {len(self._parse_urls)} 个链接…"
+            )
+        self._show_parse_status(message, error=False)
+
+    def _on_parse_succeeded(self, index: int, video_info: VideoInfo) -> None:
+        if not self._is_parsing:
+            return
+
+        self._parse_results[index] = video_info
+        self._set_current_result_status(index, "成功", "#027a48")
+        self._set_result_cell(index, 2, self._platform_display(video_info.webpage_url))
+        self._set_result_cell(index, 3, video_info.title)
+        self._set_result_cell(index, 4, video_info.uploader)
+        self._set_result_cell(index, 5, video_info.duration_display)
+        self._set_result_cell(index, 6, video_info.webpage_url)
+        self._show_video_info(video_info)
+
+    def _on_parse_failed(
+        self,
+        index: int,
+        user_message: str,
+        _detail: str,
+    ) -> None:
+        if not self._is_parsing:
+            return
+
+        self._parse_failure_messages[index] = user_message
+        self._set_current_result_status(
+            index,
+            f"失败：{user_message}",
+            "#b42318",
+        )
+        if len(self._parse_urls) == 1:
+            self._show_parse_status(
+                self._format_failure("解析失败", user_message),
+                error=True,
+            )
+        else:
+            self._show_parse_status(
+                f"第 {index + 1} 个链接解析失败：{user_message}；继续解析后续链接…",
+                error=True,
+            )
+
+    def _on_parse_finished(self, success_count: int, failure_count: int) -> None:
         if not self._is_parsing:
             return
 
         self._is_parsing = False
         self._set_interaction_state("idle")
 
+        if failure_count == 0:
+            message = f"解析完成：成功 {success_count} 个"
+        elif success_count == 0 and len(self._parse_urls) == 1:
+            message = self._format_failure(
+                "解析失败",
+                next(iter(self._parse_failure_messages.values()), "解析失败"),
+            )
+        else:
+            message = (
+                f"解析完成：成功 {success_count} 个，失败 {failure_count} 个"
+            )
+        self._show_parse_status(message, error=failure_count > 0)
+
+    def _show_video_info(self, video_info: VideoInfo) -> None:
         self.id_value.setText(video_info.video_id)
         self.title_value.setText(video_info.title)
         self.uploader_value.setText(video_info.uploader)
@@ -407,21 +592,16 @@ class MainWindow(QMainWindow):
         self.formats_view.setPlainText(
             "\n".join(format_lines) if format_lines else "未检测到可用格式"
         )
-        self._show_parse_status(
-            f"解析成功，共发现 {len(video_info.formats)} 个可用格式",
-            error=False,
-        )
 
-    def _on_parse_failed(self, user_message: str, _detail: str) -> None:
-        if not self._is_parsing:
+    def _set_result_cell(self, index: int, column: int, value: str) -> None:
+        item = self.parse_results_table.item(index, column)
+        if item is None:
+            item = QTableWidgetItem(value)
+            self.parse_results_table.setItem(index, column, item)
             return
-
-        self._is_parsing = False
-        self._set_interaction_state("idle")
-        self._show_parse_status(
-            self._format_failure("解析失败", user_message),
-            error=True,
-        )
+        item.setText(value)
+        if column == 6:
+            item.setToolTip(value)
 
     def _reset_download_progress(self) -> None:
         self.download_progress_bar.setRange(0, 100)
@@ -589,6 +769,23 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         color = "#b42318" if error else "#175cd3"
         self.parse_status.setStyleSheet(f"color: {color};")
+
+    @staticmethod
+    def _platform_display(url: str) -> str:
+        platform_names = {
+            "youtube": "YouTube",
+            "bilibili": "Bilibili",
+            "tiktok": "TikTok",
+            "x": "X",
+            "douyin": "抖音",
+        }
+        platform = detect_platform(url)
+        if platform != "unknown":
+            return platform_names.get(platform, platform)
+        try:
+            return urlsplit(url).netloc or "未知"
+        except ValueError:
+            return "未知"
 
     @staticmethod
     def _platform_name(webpage_url: str) -> str:
