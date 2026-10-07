@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-项目已完成基础架构、视频 URL 信息解析、单个视频下载、下载进度显示、FFmpeg 自动发现、Cookie 文件支持和 Cookie 智能使用策略。
+项目已完成基础架构、视频 URL 信息解析、单个视频下载、下载进度显示、FFmpeg 自动发现、Cookie 文件支持、Cookie 智能使用策略，以及 Stage 7.1 网络环境兼容验证与 Node.js + yt-dlp-ejs 支持。
 
 当前已具备：
 
@@ -19,6 +19,8 @@
 - 自动发现 FFmpeg，并将路径传给 yt-dlp
 - 支持选择、保存和清除 Netscape 格式的 Cookie 文件路径
 - 根据平台策略决定是否把已配置的 Cookie 文件交给 yt-dlp
+- 网络出口由 v2rayN / Windows 全局网络环境决定，程序不内置代理管理
+- 使用 Node.js + yt-dlp-ejs 处理 YouTube 当前 JS Challenge
 - 后台线程解析与下载，避免阻塞 GUI 主线程
 - 友好中文错误提示与日志记录
 
@@ -39,6 +41,7 @@
 - 画质选择
 - 暂停与取消
 - PyInstaller 打包
+- 内置代理地址、端口、开关、代理池或平台代理切换
 
 ## 安装与运行
 
@@ -60,6 +63,8 @@ python main.py
 
 - PyQt6：图形界面
 - yt-dlp：视频信息解析与下载引擎
+- yt-dlp-ejs：yt-dlp 的 JavaScript Challenge 求解组件
+- Node.js：YouTube JS Challenge 的系统运行时，由 yt-dlp 从 PATH 查找
 
 ## 使用方法
 
@@ -178,6 +183,54 @@ YtDlpService
 yt-dlp
 ```
 
+## Node.js + yt-dlp-ejs 支持
+
+项目已在 `YtDlpService` 的统一 yt-dlp options 构造位置启用 Node.js 运行时：
+
+```text
+YtDlpService
+    ↓
+js_runtimes = {"node": {}}
+    ↓
+yt-dlp 从当前系统 PATH 查找 Node.js
+    ↓
+yt-dlp-ejs 提供 JavaScript Challenge 求解脚本
+    ↓
+YouTube 解析或下载
+```
+
+解析和下载共用同一个内部辅助函数，不在 UI、Downloader 或多个文件中重复配置。代码不写死 `C:\软件\node.js\node.exe` 或其他 Node.js 绝对路径，因此开发环境和以后 PyInstaller 环境都应通过系统 PATH 提供 Node.js。`requirements.txt` 已包含 `yt-dlp-ejs`。
+
+当前验证环境中 yt-dlp 能识别 Node.js 运行时，并使用 yt-dlp-ejs 0.8.0 求解 YouTube JS Challenge。服务层传入有效 YouTube Cookie 文件时，`https://youtu.be/eDrH-noimf8` 的解析和实际下载均成功。现有 Stage 6.1 平台策略仍保持 YouTube 为 `NEVER`，因此普通项目解析不会自动使用配置的 Cookie 文件；如当前代理出口触发 YouTube 机器人校验，会继续显示现有中文登录/Cookie 提示。
+
+## Stage 7.1：网络环境与代理策略
+
+本阶段不实现软件内置代理系统。项目不保存代理地址，不提供代理地址、端口、开关、代理池或平台代理切换，也不修改 Windows 系统代理、不调用 v2rayN API、不检测 v2rayN 是否安装。
+
+网络路径由外部环境决定：
+
+```text
+v2rayN / Windows 全局网络环境
+    ↓
+如意视频下载器
+    ↓
+yt-dlp
+    ↓
+各平台
+```
+
+yt-dlp 直接继承程序启动时的 Windows 网络环境，因此 v2rayN 关闭时使用当前直连网络，开启全局代理时由 v2rayN 提供网络出口。Cookie 文件仍由现有 cookiefile 配置独立传递，网络层与 Cookie 层保持解耦。未来多链接解析也应统一复用当前 Windows 网络环境，不引入全局、当前或按平台变化的软件代理状态。
+
+本阶段已完成以下记录：
+
+- Windows 系统代理开启（`127.0.0.1:10808`）环境下的代码检查、GUI 启动和平台回归：PASS
+- Bilibili、TikTok、X、Douyin 的实际解析、下载、进度和输出文件检查：PASS
+- YouTube Node.js + yt-dlp-ejs 服务层解析、实际下载和输出文件检查：PASS
+- YouTube 按 Stage 6.1 `NEVER` 策略的普通项目解析：FAIL（当前代理出口返回机器人校验提示）
+- v2rayN 关闭环境：NOT TESTED（未切换用户的系统代理设置）
+- v2rayN 具体节点名称：NOT TESTED（终端无法读取 v2rayN 内部节点选择）
+- 未新增代理代码；`yt-dlp-ejs` 是本次唯一新增依赖；未修改 Cookie、FFmpeg、下载进度或平台识别策略
+
 ## 代码分层
 
 URL 解析调用流程：
@@ -278,8 +331,21 @@ logs/ruyi.log
 - YouTube 无 Cookie 与已配置 Cookie 两种状态解析对比
 - Cookie 平台策略诊断日志与敏感信息扫描
 - Cookie 策略下 FFmpeg 自动发现、下载进度与 GUI 响应回归
+- 硬编码代理扫描与全局代理状态扫描
+- compileall 和核心模块导入检查
+- 完整程序与 Cookie UI 启动检查
+- v2rayN 全局代理开启时的 Bilibili、TikTok、X、Douyin 解析与实际下载
+- v2rayN 全局代理开启时使用服务层显式 YouTube Cookie 的 YouTube 解析与实际下载
+- v2rayN 全局代理开启时的下载进度与 GUI 响应检查
+- `yt-dlp-ejs` Python 模块导入、yt-dlp 依赖识别和 Node.js PATH 检测
+- yt-dlp `js_runtimes` 解析与 YouTube JavaScript Challenge 求解
+- requirements 依赖一致性与 `pip check`
+- 硬编码代理参数、代理 URL 和软件代理状态扫描
+- Cookie 平台策略回归与敏感信息日志扫描
 
-测试中使用指定 Bilibili 视频完成了下载，输出文件同时包含 H.264 视频流和 AAC 音频流，并通过 FFmpeg 解码检查；同时使用 TikTok 和 X 视频验证原有下载流程仍然正常。已配置 Cookie 时 YouTube、Bilibili、TikTok、X 均可正常解析，Bilibili、TikTok、X 也可正常下载，说明 Cookie 不会再被强制应用到这些平台。Douyin 在无 Cookie 时会显示已有的登录/Cookie 中文提示；使用本机已配置的 Cookie 文件时，平台识别和 Cookie 传递均正常，但当前网络环境下 yt-dlp 仍返回 HTTP 403 / Fresh cookies 提示，因此本阶段不声称抖音下载成功。本阶段没有修改代理功能。
+Stage 7.1 在当前 Windows 系统代理开启环境完成了收尾回归。Bilibili、TikTok、X、Douyin 均完成实际解析和下载，下载进度正常；Bilibili 分离格式由自动发现的 FFmpeg 完成合并，输出文件包含 H.264 视频流和 AAC 音频流并可解码播放。Douyin 使用当前已配置 Cookie 文件和当前系统代理环境成功解析、下载并合并，但终端无法读取 v2rayN 内部节点名称，因此只记录系统代理地址，不猜测节点。
+
+YouTube 服务层在显式传入有效 YouTube Cookie 文件时，Node.js + yt-dlp-ejs 成功解决 JS Challenge，`https://youtu.be/eDrH-noimf8` 解析和实际下载均成功。按照 Stage 6.1 的 YouTube `NEVER` 策略，普通项目解析仍不自动使用配置 Cookie；本次该路径返回“需要登录或 Cookie”的机器人校验提示，因此 README 如实标记为 FAIL，没有通过修改 Cookie 策略掩盖该结果。v2rayN 关闭环境没有切换用户系统代理，状态为 NOT TESTED。项目代码和配置中没有代理参数、代理 URL 或软件代理状态，yt-dlp 会继承当前 Windows 网络环境。
 
 ## 下一步计划
 

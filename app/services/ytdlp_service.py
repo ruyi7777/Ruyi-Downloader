@@ -129,6 +129,7 @@ class YtDlpService:
     ) -> VideoInfo:
         """Return normalized metadata without invoking media download."""
         options = dict(_INFO_OPTIONS)
+        _apply_js_runtime(options)
         _apply_cookie_option(options, cookie_file)
 
         try:
@@ -238,6 +239,7 @@ def _build_download_options(
         "fragment_retries": 2,
         "logger": _SafeYtDlpLogger(),
     }
+    _apply_js_runtime(options)
 
     if ffmpeg_path is not None:
         options["ffmpeg_location"] = str(ffmpeg_path)
@@ -249,6 +251,11 @@ def _build_download_options(
             lambda hook_data: _emit_progress(progress_callback, hook_data)
         ]
     return options
+
+
+def _apply_js_runtime(options: Dict[str, Any]) -> None:
+    """Enable Node.js through yt-dlp's normal PATH-based runtime lookup."""
+    options["js_runtimes"] = {"node": {}}
 
 
 def _apply_cookie_option(
