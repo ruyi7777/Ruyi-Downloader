@@ -64,6 +64,10 @@ class MainWindow(QMainWindow):
         self._parse_urls: list[str] = []
         self._parse_results: dict[int, VideoInfo] = {}
         self._parse_failure_messages: dict[int, str] = {}
+        self._parse_worker: VideoInfoBatchWorker | None = None
+        self._parse_task_id = 0
+        self._active_parse_task_id: int | None = None
+        self._parse_cancel_requested = False
 
         self.setWindowTitle("如意视频下载器")
         self.setMinimumSize(880, 760)
@@ -110,13 +114,17 @@ class MainWindow(QMainWindow):
         self.url_input.setMaximumHeight(120)
         url_layout.addRow("包含链接的文本：", self.url_input)
 
+        parse_button_layout = QHBoxLayout()
+        parse_button_layout.setSpacing(8)
         self.parse_button = QPushButton("解析视频", url_group)
         self.parse_button.setObjectName("parseButton")
         self.parse_button.setToolTip(
-            "自动提取链接并逐个获取视频基本信息，不下载任何文件"
+            "解析视频；解析期间再次点击可取消当前任务"
         )
-        self.parse_button.clicked.connect(self._start_parse)
-        url_layout.addRow(self.parse_button)
+        self.parse_button.clicked.connect(self._on_parse_button_clicked)
+        parse_button_layout.addWidget(self.parse_button)
+        parse_button_layout.addStretch()
+        url_layout.addRow(parse_button_layout)
         root_layout.addWidget(url_group)
 
         cookie_group = QGroupBox("Cookie 文件", self)
@@ -380,9 +388,23 @@ class MainWindow(QMainWindow):
         logger.info("Cookie file cleared")
         self.statusBar().showMessage("Cookie 配置已清除，原文件未删除")
 
+    def _on_parse_button_clicked(self) -> None:
+        """Use one button to start parsing or request cancellation."""
+        if self._parse_cancel_requested:
+            return
+        if self._is_parsing:
+            self._cancel_parse()
+            return
+        self._start_parse()
+
     def _start_parse(self) -> None:
         """Extract URLs and start sequential background parsing."""
-        if self._is_parsing or self._is_downloading:
+        if (
+            self._is_parsing
+            or self._is_downloading
+            or self._parse_worker is not None
+            or self._active_parse_task_id is not None
+        ):
             return
 
         urls = extract_http_urls(self.url_input.toPlainText())
@@ -397,6 +419,10 @@ class MainWindow(QMainWindow):
         # exactly the URLs that were extracted and de-duplicated.
         self.url_input.setPlainText("\n".join(urls))
         self._parse_urls = urls
+        self._parse_task_id += 1
+        task_id = self._parse_task_id
+        self._active_parse_task_id = task_id
+        self._parse_cancel_requested = False
         self._is_parsing = True
         self._set_interaction_state("parsing")
         self._reset_video_info()
@@ -407,11 +433,55 @@ class MainWindow(QMainWindow):
         )
 
         worker = VideoInfoBatchWorker(urls, parser=self.parser)
-        worker.signals.started.connect(self._on_parse_started)
-        worker.signals.succeeded.connect(self._on_parse_succeeded)
-        worker.signals.failed.connect(self._on_parse_failed)
-        worker.signals.finished.connect(self._on_parse_finished)
+        worker.signals.started.connect(
+            lambda index, current_task_id=task_id: self._on_parse_started(
+                current_task_id,
+                index,
+            )
+        )
+        worker.signals.succeeded.connect(
+            lambda index, video_info, current_task_id=task_id: (
+                self._on_parse_succeeded(current_task_id, index, video_info)
+            )
+        )
+        worker.signals.failed.connect(
+            lambda index, user_message, detail, current_task_id=task_id: (
+                self._on_parse_failed(
+                    current_task_id,
+                    index,
+                    user_message,
+                    detail,
+                )
+            )
+        )
+        worker.signals.finished.connect(
+            lambda success_count, failure_count, current_task_id=task_id: (
+                self._on_parse_finished(
+                    current_task_id,
+                    success_count,
+                    failure_count,
+                )
+            )
+        )
+        self._parse_worker = worker
         QThreadPool.globalInstance().start(worker)
+
+    def _cancel_parse(self) -> None:
+        """Request cooperative cancellation while keeping the GUI responsive."""
+        if (
+            not self._is_parsing
+            or self._parse_worker is None
+            or self._parse_cancel_requested
+        ):
+            return
+
+        self._parse_cancel_requested = True
+        self._parse_worker.cancel()
+        self._set_interaction_state("cancelling")
+        self._show_parse_status(
+            "正在取消解析；当前请求将在超时上限内退出，尚未开始的链接不会继续",
+            error=False,
+        )
 
     def _start_download(self) -> None:
         """Start one background download without blocking the GUI thread."""
@@ -448,12 +518,15 @@ class MainWindow(QMainWindow):
 
     def _set_interaction_state(self, state: str) -> None:
         busy = state != "idle"
-        self.parse_button.setEnabled(not busy)
+        self.parse_button.setEnabled(state in {"idle", "parsing"})
         self.download_button.setEnabled(not busy)
         self.url_input.setEnabled(not busy)
 
         if state == "parsing":
-            self.parse_button.setText("正在解析…")
+            self.parse_button.setText("取消解析")
+            self.download_button.setText("开始下载")
+        elif state == "cancelling":
+            self.parse_button.setText("正在取消…")
             self.download_button.setText("开始下载")
         elif state == "downloading":
             self.parse_button.setText("解析视频")
@@ -508,8 +581,14 @@ class MainWindow(QMainWindow):
             label.setText("—")
         self.formats_view.clear()
 
-    def _on_parse_started(self, index: int) -> None:
-        if not self._is_parsing:
+    def _is_current_parse_task(self, task_id: int) -> bool:
+        return (
+            self._active_parse_task_id == task_id
+            and self._parse_worker is not None
+        )
+
+    def _on_parse_started(self, task_id: int, index: int) -> None:
+        if not self._is_current_parse_task(task_id):
             return
 
         self._set_current_result_status(index, "解析中", "#175cd3")
@@ -521,8 +600,13 @@ class MainWindow(QMainWindow):
             )
         self._show_parse_status(message, error=False)
 
-    def _on_parse_succeeded(self, index: int, video_info: VideoInfo) -> None:
-        if not self._is_parsing:
+    def _on_parse_succeeded(
+        self,
+        task_id: int,
+        index: int,
+        video_info: VideoInfo,
+    ) -> None:
+        if not self._is_current_parse_task(task_id):
             return
 
         self._parse_results[index] = video_info
@@ -536,11 +620,12 @@ class MainWindow(QMainWindow):
 
     def _on_parse_failed(
         self,
+        task_id: int,
         index: int,
         user_message: str,
         _detail: str,
     ) -> None:
-        if not self._is_parsing:
+        if not self._is_current_parse_task(task_id):
             return
 
         self._parse_failure_messages[index] = user_message
@@ -560,12 +645,46 @@ class MainWindow(QMainWindow):
                 error=True,
             )
 
-    def _on_parse_finished(self, success_count: int, failure_count: int) -> None:
-        if not self._is_parsing:
+    def _on_parse_finished(
+        self,
+        task_id: int,
+        success_count: int,
+        failure_count: int,
+    ) -> None:
+        if not self._is_current_parse_task(task_id):
+            logger.debug(
+                "Ignoring stale parse signal: task=%s, active=%s",
+                task_id,
+                self._active_parse_task_id,
+            )
             return
 
+        total_count = len(self._parse_urls)
+        pending_count = max(0, total_count - success_count - failure_count)
+        cancelled = self._parse_cancel_requested and pending_count > 0
+
         self._is_parsing = False
+        self._parse_worker = None
+        self._active_parse_task_id = None
+        self._parse_cancel_requested = False
         self._set_interaction_state("idle")
+
+        if cancelled:
+            self._mark_unfinished_results_as_cancelled()
+            message = (
+                f"解析已取消：成功 {success_count} 个，"
+                f"失败 {failure_count} 个，未完成 {pending_count} 个"
+            )
+            self._show_parse_status(message, error=False)
+            logger.info(
+                "Parsing cancelled from GUI: total=%s, success=%s, "
+                "failure=%s, pending=%s",
+                total_count,
+                success_count,
+                failure_count,
+                pending_count,
+            )
+            return
 
         if failure_count == 0:
             message = f"解析完成：成功 {success_count} 个"
@@ -579,6 +698,15 @@ class MainWindow(QMainWindow):
                 f"解析完成：成功 {success_count} 个，失败 {failure_count} 个"
             )
         self._show_parse_status(message, error=failure_count > 0)
+
+    def _mark_unfinished_results_as_cancelled(self) -> None:
+        """Preserve completed rows and mark only unfinished rows as cancelled."""
+        for row in range(self.parse_results_table.rowCount()):
+            item = self.parse_results_table.item(row, 1)
+            if item is None:
+                continue
+            if item.text() in {"等待", "解析中"}:
+                self._set_current_result_status(row, "已取消", "#667085")
 
     def _show_video_info(self, video_info: VideoInfo) -> None:
         self.id_value.setText(video_info.video_id)
@@ -795,6 +923,8 @@ class MainWindow(QMainWindow):
             return "未知"
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
-        """Log window closure without waiting for background workers."""
+        """Request cancellation on close without blocking the GUI thread."""
+        if self._parse_worker is not None:
+            self._parse_worker.cancel()
         logger.info("Main window closed")
         super().closeEvent(event)

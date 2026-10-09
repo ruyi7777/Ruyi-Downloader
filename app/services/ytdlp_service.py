@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -17,7 +18,12 @@ from app.core.download_models import (
     DownloadResult,
     DownloadStatus,
 )
-from app.core.video_info import VideoFormatInfo, VideoInfo, VideoParseError
+from app.core.video_info import (
+    VideoFormatInfo,
+    VideoInfo,
+    VideoParseCancelled,
+    VideoParseError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,13 +101,58 @@ class _SafeYtDlpLogger:
         logger.warning("yt-dlp error: %s", _sanitize_detail(message))
 
 
+class _CancellableYtDlpLogger:
+    """Check a shared cancellation event at yt-dlp logging checkpoints."""
+
+    def __init__(self, cancel_event: threading.Event) -> None:
+        self._cancel_event = cancel_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise VideoParseCancelled()
+
+    def debug(self, _message: str) -> None:
+        self._raise_if_cancelled()
+
+    def info(self, _message: str) -> None:
+        self._raise_if_cancelled()
+
+    def warning(self, message: str) -> None:
+        self._raise_if_cancelled()
+        _SafeYtDlpLogger.warning(message)
+
+    def error(self, message: str) -> None:
+        self._raise_if_cancelled()
+        _SafeYtDlpLogger.error(message)
+
+
+def _build_info_options(
+    cancel_event: Optional[threading.Event] = None,
+) -> Dict[str, Any]:
+    """Build metadata-extraction options without changing download options."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoParseCancelled()
+
+    options = dict(_INFO_OPTIONS)
+    if cancel_event is not None:
+        options["logger"] = _CancellableYtDlpLogger(cancel_event)
+    _apply_js_runtime(options)
+    return options
+
+
+# Parsing-only network limits. socket_timeout bounds each network operation,
+# while extractor_retries controls known extractor retries; the download-only
+# "retries" option is intentionally not used for metadata extraction.
+_INFO_SOCKET_TIMEOUT_SECONDS = 12.0
+_INFO_EXTRACTOR_RETRIES = 1
+
 _INFO_OPTIONS: Dict[str, Any] = {
     "skip_download": True,
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "socket_timeout": 15,
-    "retries": 1,
+    "socket_timeout": _INFO_SOCKET_TIMEOUT_SECONDS,
+    "extractor_retries": _INFO_EXTRACTOR_RETRIES,
     "logger": _SafeYtDlpLogger(),
 }
 
@@ -126,10 +177,10 @@ class YtDlpService:
         self,
         url: str,
         cookie_file: Optional[Path] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> VideoInfo:
         """Return normalized metadata without invoking media download."""
-        options = dict(_INFO_OPTIONS)
-        _apply_js_runtime(options)
+        options = _build_info_options(cancel_event)
         _apply_cookie_option(options, cookie_file)
 
         try:
@@ -138,6 +189,8 @@ class YtDlpService:
         except VideoParseError:
             raise
         except Exception as error:
+            if cancel_event is not None and cancel_event.is_set():
+                raise VideoParseCancelled() from None
             raw_detail = f"{type(error).__name__}: {error}"
             if _is_cookie_file_error(raw_detail.lower()):
                 logger.warning(
@@ -150,6 +203,9 @@ class YtDlpService:
             detail = _sanitize_detail(raw_detail)
             logger.warning("yt-dlp extraction failed: %s", detail)
             raise VideoParseError(_friendly_parse_error(detail), detail) from error
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoParseCancelled()
 
         selected_info = _select_video_entry(raw_info)
         if selected_info is None:
@@ -493,6 +549,12 @@ def _friendly_parse_error(detail: str) -> str:
     if _is_cookie_file_error(message):
         return _cookie_failure_message(message)
 
+    if _is_timeout_error(message):
+        return "解析超时，请检查网络后重试"
+
+    if _is_connection_error(message):
+        return "网络连接失败，请检查网络后重试"
+
     if any(
         marker in message
         for marker in (
@@ -666,6 +728,37 @@ def _is_unavailable(message: str) -> bool:
             "has been removed",
             "video has been deleted",
             "not available",
+        )
+    )
+
+
+def _is_timeout_error(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "timed out",
+            "timeout",
+            "read timeout",
+            "socket timeout",
+            "timeouterror",
+        )
+    )
+
+
+def _is_connection_error(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "unable to download webpage",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "failed to establish a new connection",
+            "network is unreachable",
+            "getaddrinfo failed",
+            "name resolution",
+            "urlopen error",
         )
     )
 

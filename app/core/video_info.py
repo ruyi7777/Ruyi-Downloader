@@ -14,6 +14,13 @@ class VideoParseError(RuntimeError):
         self.detail = detail
 
 
+class VideoParseCancelled(VideoParseError):
+    """A cooperative parsing cancellation, distinct from a normal failure."""
+
+    def __init__(self, detail: str = "Parsing cancelled by user") -> None:
+        super().__init__("解析已取消", detail)
+
+
 @dataclass(frozen=True)
 class VideoFormatInfo:
     """One available media format returned by yt-dlp."""

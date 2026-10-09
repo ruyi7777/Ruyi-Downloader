@@ -979,6 +979,37 @@ finished(success_count, failure_count)
 - Cookie 浏览器自动导入
 - PyInstaller
 
+### 10.6 Stage 8.1.1 视频解析超时与可取消机制
+
+Stage 8.1.1 只修改视频信息解析链路：
+
+- 解析专用 `socket_timeout=12`
+- 解析专用 `extractor_retries=1`
+- 下载 options 继续保持 `socket_timeout=15`、`retries=2`、`fragment_retries=2`
+- 超时、连接失败和其他错误使用不同中文提示
+- `VideoInfoBatchWorker` 使用 `threading.Event` 协作取消
+- Worker 在每个新 URL 前检查取消状态
+- `VideoInfoParser` 把事件传给 `YtDlpService`
+- yt-dlp logger 检查点发现事件后抛出 `VideoParseCancelled`
+- GUI 立即显示“正在取消”，完成后恢复按钮
+- 成功和失败结果保留，未完成行显示“已取消”
+
+限制：当前阻塞网络操作不会被强制终止。单次网络操作等待上限为 12 秒；一个 URL 可能包含多个顺序请求，因此没有整个 URL 的绝对总时长硬上限。
+
+### 10.7 Stage 8.1.2 单按钮取消交互
+
+Stage 8.1.2 只调整 GUI 交互，不重新实现取消机制：
+
+- 空闲状态主按钮显示“解析视频”
+- 解析进行中同一按钮显示“取消解析”
+- 二次点击调用已有 `VideoInfoBatchWorker.cancel()`
+- 取消请求发出后显示“正在取消…”并禁用按钮
+- 不再创建独立取消按钮
+- 每轮解析使用任务 ID 连接信号
+- 旧 Worker 的延迟 started/succeeded/failed/finished 信号会被忽略
+- 正常完成和取消完成都恢复主按钮
+- Stage 8.1.1 的超时、错误分类、结果保留和协作取消保持不变
+
 ---
 
 ## 11. 已完成功能与未完成功能
@@ -998,13 +1029,15 @@ finished(success_count, failure_count)
 - Node.js + yt-dlp-ejs
 - 全局代理环境兼容验证
 - Stage 8.1 多链接解析和 URL 自动清洗
+- Stage 8.1.1 视频解析超时与可取消机制
+- Stage 8.1.2 单按钮解析/取消交互
 
 ### 11.2 当前明确未完成
 
 - 多链接下载
 - 任务队列
 - 并发解析/下载
-- 暂停、取消、重试
+- 下载任务的暂停、取消、重试（视频解析取消已支持）
 - 画质选择 UI
 - 重复下载检测
 - 下载目录设置页面
@@ -1043,6 +1076,18 @@ git status --short --branch
 | `git diff --check` | PASS |
 | 工作区 | clean（生成 HANDOFF 前） |
 | Git 分支状态 | `main`，ahead 1 |
+
+Stage 8.1.1/8.1.2 当前验证结果：
+
+| 测试 | 状态 |
+|---|---|
+| unittest 自动测试（23 项） | PASS |
+| Python 语法与核心导入（29 个文件） | PASS |
+| `pip check` | PASS |
+| `git diff --check` | PASS |
+| 离屏完整程序启动到主窗口创建 | PASS |
+| 真实鼠标交互取消 | NOT TESTED |
+| 真实国外网络超时回归 | NOT TESTED |
 
 ### 12.2 Stage 8.1 测试文件
 
@@ -1085,6 +1130,32 @@ git status --short --branch
 - 无 URL 保留原文
 - 普通、最大化、恢复布局不重叠
 - 解析和下载 options 都启用 `js_runtimes={"node": {}}`
+
+#### `tests/test_parse_timeout.py`
+
+覆盖：
+
+- 正常解析成功
+- 网络超时与连接失败的中文错误区分
+- 其他错误不误报为视频不存在
+- 解析专用超时和提取器重试参数
+- 下载超时、重试和进度参数不回归
+- 取消事件的请求前检查和 yt-dlp logger 检查点
+
+#### `tests/test_parse_cancellation.py`
+
+覆盖：
+
+- 空闲、解析中、取消中和完成后的单按钮状态
+- 二次点击同一按钮启动取消而不是重新解析
+- 重复取消不会异常
+- 旧任务延迟信号不会影响新任务
+- 取消后不启动后续 URL
+- 已成功结果保留
+- 取消不计入普通失败
+- Parser 接收线程安全取消事件
+- 离屏 GUI 点击取消后的状态、按钮恢复和再次解析
+- 解析期间事件循环持续响应
 
 ### 12.3 真实网络回归
 
