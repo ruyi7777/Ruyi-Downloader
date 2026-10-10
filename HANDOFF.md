@@ -1,9 +1,12 @@
 # Ruyi Video Downloader 技术交接文档（HANDOFF）
 
-> 文档用途：供下一位 AI 编程助手 / Codex 直接接手开发使用。<br>
-> 本文不是面向普通用户的项目介绍，而是记录**当前真实代码状态、架构约束、已验证事实、已知故障、测试方式和下一步边界**。<br>
-> 生成日期：2026-10-07。<br>
-> 如果本文与实际文件、Git 状态或运行环境冲突，**以实际代码和实际命令输出为准**，并更新本文。
+> 文档用途：供下一位 AI 编程助手 / Codex 快速理解当前技术实现。
+>
+> 本文只维护架构、模块、调用链、实现约束、故障排查和技术交接信息。
+>
+> 当前状态、Git、环境和验证结果见 `PROJECT_STATUS.md`；阶段规划见 `ROADMAP.md`；工程规则见 `AGENTS.md`。
+>
+> 更新日期：2026-10-10。如果本文与实际代码冲突，以实际代码和命令输出为准。
 
 ---
 
@@ -11,53 +14,51 @@
 
 接手后不要直接改代码，按以下顺序执行：
 
-1. 阅读 `AGENTS.md`，这是项目最高优先级开发规则。
-2. 阅读 `README.md`，确认对外功能描述。
-3. 执行本文第 13 节的基础验收命令。
-4. 阅读本文第 4、5、8、9、10 节，理解架构、Cookie、代理、Node.js 和 Stage 8.1。
-5. 在确认工作区状态后，再进行最小范围修改。
-6. 修改后必须重新执行语法、导入、单元测试和相关真实回归测试。
-7. 未经用户明确要求，不执行 `git commit`、`git push`、`git reset`、`git clean`、`git checkout -- .` 等操作。
+1. 阅读 `AGENTS.md`，确认工程规则和修改边界。
+2. 阅读 `PROJECT_STATUS.md`，确认当前分支、commit、环境和验证状态。
+3. 阅读 `ROADMAP.md`，确认当前阶段、下一阶段和未开始阶段。
+4. 阅读本文第 3 至 10 节，理解架构、解析、下载、Cookie、FFmpeg、代理和 Node.js。
+5. 检查 `git status --short --branch`，保护工作区已有修改。
+6. 修改后执行语法、导入、单元测试和 `git diff --check`。
+7. 未经用户明确要求，不执行 commit、push、reset、restore 或 clean。
 
 ---
 
-## 1. 项目基本信息
+## 1. 文档职责与事实来源
 
-### 1.1 项目标识
+本文的技术事实优先级为：
 
-| 项目 | 实际值 |
-|---|---|
-| 项目名称 | Ruyi Video Downloader（如意视频下载器） |
-| 项目路径 | `C:\xiangmu\video tiqu` |
-| 项目用途 | Windows 桌面视频信息解析和视频下载工具 |
-| 主要 GUI | PyQt6 |
-| 下载/解析引擎 | yt-dlp |
-| 音视频合并 | FFmpeg |
-| 计划打包工具 | PyInstaller（当前尚未安装，也尚未打包） |
-| Git 仓库 | `https://github.com/ruyi7777/Ruyi-Downloader.git` |
-| 当前分支 | `main` |
+```text
+实际代码 / Git 命令输出
+    ↓
+PROJECT_STATUS.md
+    ↓
+HANDOFF.md / README.md
+    ↓
+ROADMAP.md
+    ↓
+如意下载总设计文档.txt
+```
 
-### 1.2 当前实际环境版本
+本文重点保留：
 
-以下版本来自当前 `.venv` 和本机实际命令，不是根据 README 猜测：
+- 项目架构和模块职责；
+- UI → Worker → Core → Service → yt-dlp / FFmpeg 调用链；
+- URL 解析和批量解析流程；
+- 单视频下载和进度流程；
+- Cookie、FFmpeg、Node.js 和网络代理约束；
+- Stage 8.1.x 的实现细节；
+- 常见故障排查和安全不变式。
 
-| 组件 | 实际状态 |
-|---|---|
-| Windows | Windows 11，`Windows-11-10.0.26200-SP0` |
-| Python | `3.13.16` |
-| 虚拟环境 | `C:\xiangmu\video tiqu\.venv` |
-| PyQt6 distribution | `6.11.0` |
-| Qt runtime | `6.11.0` |
-| yt-dlp | `2026.08.19` |
-| yt-dlp-ejs | `0.8.0` |
-| 用户机器 Node.js | `C:\软件\node.js\node.exe`，`v24.21.0` |
-| 当前 Codex shell PATH 中的 Node.js | `C:\Users\ruyi\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe`，`v24.19.0` |
-| FFmpeg | `C:\xiangmu\tools\ffmpeg-9.0.2-essentials_build\bin\ffmpeg.exe` |
-| FFmpeg 版本 | `ffmpeg version 9.0.2-essentials_build-www.gyan.dev` |
-| PyInstaller | 当前 `.venv` **未安装**，`requirements.txt` 也未包含 |
-| Git remote | `origin` → `https://github.com/ruyi7777/Ruyi-Downloader.git` |
+当前分支、commit、Python/依赖版本、功能状态、已验证/未验证项目不在此处维护，统一见 `PROJECT_STATUS.md`。
 
-### 1.3 `requirements.txt` 当前完整内容
+---
+
+## 2. 技术范围与依赖边界
+
+本文记录当前技术实现，不承担 Git、环境版本或产品状态统计。
+
+当前 Python 依赖以 `requirements.txt` 为准：
 
 ```text
 PyQt6>=6.6,<7
@@ -65,83 +66,24 @@ yt-dlp>=2026.8.19,<2027
 yt-dlp-ejs>=0.8.0,<0.9
 ```
 
-当前环境 `pip check` 结果：
+Node.js 和 FFmpeg 是外部运行时，不写入 `requirements.txt`，也不应硬编码到业务代码。
+
+解析专用参数：
 
 ```text
-No broken requirements found.
+socket_timeout = 12
+extractor_retries = 1
 ```
 
-不要为了本机 Node.js 或 FFmpeg 的绝对路径添加依赖。Node.js 和 FFmpeg 都是外部运行时。
-
----
-
-## 2. 当前 Git 状态
-
-### 2.1 生成本文时的实际状态
-
-生成 `HANDOFF.md` 之前实际检查结果：
-
-- 当前分支：`main`
-- HEAD：`5a5ab0a303ec905078015f76a773442bcaa946b0`
-- HEAD 摘要：`5a5ab0a 实现多链接解析与URL自动清洗`
-- HEAD 时间：`2026-10-07 16:26:11 +08:00`
-- 工作区：clean
-- upstream：`origin/main`
-- 相对 upstream：ahead 1、behind 0
-- remote HEAD：`2f19e3c 完善全局代理环境兼容与YouTube运行时支持`
-- 当前是否 push：**Stage 8.1 尚未 push**
-- 最近完成 Stage：**Stage 8.1 多链接解析 + URL 自动提取与清洗**
-
-生成本文件后，若尚未提交，`git status` 应出现：
+下载专用参数：
 
 ```text
-?? HANDOFF.md
+socket_timeout = 15
+retries = 2
+fragment_retries = 2
 ```
 
-这是预期状态。不要因为出现该文件就执行破坏性 Git 操作。
-
-### 2.2 最近重要提交
-
-```text
-5a5ab0a 实现多链接解析与URL自动清洗
-2f19e3c 完善全局代理环境兼容与YouTube运行时支持
-05bad5e 实现Cookie支持与智能平台策略
-ccd85bd 实现FFmpeg自动发现与配置
-71940ad 实现下载进度显示
-3afa61e 实现单个视频下载
-fe7d775 实现 yt-dlp 视频信息解析
-0fae96b 完成项目基础骨架
-```
-
-### 2.3 Stage 8.1 提交内容
-
-```text
-README.md
-app/core/url_extractor.py
-app/ui/main_window.py
-app/ui/video_info_worker.py
-tests/test_main_window_batch.py
-tests/test_stage81_fixes.py
-tests/test_url_extractor.py
-tests/test_video_info_batch_worker.py
-```
-
-Stage 8.1 不是 Git 历史重写，也不是 Cookie、代理或 FFmpeg 功能重构。
-
-### 2.4 Git 安全要求
-
-默认禁止执行：
-
-```powershell
-git commit
-git push
-git reset --hard
-git clean
-git checkout -- .
-git restore .
-```
-
-只有用户明确要求时才可以执行相应操作。尤其禁止为了“清理工作区”直接覆盖用户本地配置或未提交修改。
+当前实现边界、版本和 Git 状态分别见 `PROJECT_STATUS.md` 与 `ROADMAP.md`。
 
 ---
 
@@ -150,7 +92,7 @@ git restore .
 以下为排除 `__pycache__` 后的当前结构：
 
 ```text
-C:\xiangmu\video tiqu\
+D:\xiangmu\ruyi\video tiqu\
 ├── main.py
 ├── AGENTS.md
 ├── README.md
@@ -414,7 +356,7 @@ _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.2
 }
 ```
 
-该文件当前与 Git HEAD 一致。
+当前配置值以实际文件和 `PROJECT_STATUS.md` 为准，不把本机运行时状态写死到本文。
 
 ### 5.2 配置兼容逻辑
 
@@ -441,10 +383,10 @@ _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.2
 
 必须保留以下交接事实：
 
-曾经 `config/settings.json` 中出现：
+曾经 `config/settings.json` 中出现过类似的本机 Cookie 文件绝对路径，例如：
 
-```json
-"cookie_file": "C:\\Users\\ruyi\\Downloads\\www.douyin.com_cookies.txt"
+```text
+C:\Users\<user>\Downloads\<site>_cookies.txt
 ```
 
 这不是 Stage 8.1 的代码修改，也不是把 Cookie 内容提交到 Git。原因是用户在 GUI 中点击“选择 Cookie”后，`app/ui/main_window.py` 执行：
@@ -458,11 +400,7 @@ self.settings.set(
 ```
 
 它只保存**本机文件路径**，属于正常的本地运行时配置。<br>
-当前文件已恢复为 Git HEAD 的：
-
-```json
-"cookie_file": ""
-```
+当前默认配置应保持 `cookie_file` 为空；实际值以配置文件和 Git 状态为准。
 
 下一位助手：
 
@@ -667,11 +605,13 @@ Cookie + proxy
 - 不把 `C:\xiangmu\...` 写死到多个文件
 - FFmpeg 缺失时程序不能崩溃，应转换为中文错误
 
-当前用户机器 FFmpeg 实际位于：
+当前检查环境中自动发现到的 FFmpeg 位于：
 
 ```text
-C:\xiangmu\tools\ffmpeg-9.0.2-essentials_build\bin\ffmpeg.exe
+D:\xiangmu\ruyi\tools\ffmpeg-2026-10-08-git-ec420ba161-essentials_build\bin\ffmpeg.exe
 ```
+
+这是当前机器的环境事实，不是应硬编码进项目的唯一方案。
 
 该路径是测试环境事实，不是应硬编码进项目的唯一方案。
 
@@ -730,7 +670,7 @@ v2rayN
 
 ### 8.3 当前硬编码代理检查
 
-生成本文前执行过针对以下关键字的代码检查：
+可执行针对以下关键字的代码检查：
 
 ```text
 proxy
@@ -1010,242 +950,101 @@ Stage 8.1.2 只调整 GUI 交互，不重新实现取消机制：
 - 正常完成和取消完成都恢复主按钮
 - Stage 8.1.1 的超时、错误分类、结果保留和协作取消保持不变
 
----
+### 10.8 Stage 8.1.3：解析取消机制技术调查
 
-## 11. 已完成功能与未完成功能
+本阶段是只读调查，没有修改业务代码。
 
-### 11.1 已完成
+针对当前安装的 yt-dlp 2026.08.19 和 Python 3.13：
 
-- 项目基础骨架
-- PyQt6 主窗口
-- 配置系统
-- 日志系统
-- yt-dlp 视频信息解析
-- 单个视频下载
-- yt-dlp 原生下载进度
-- FFmpeg 自动发现
-- Cookie 文件路径选择/保存/清除
-- 平台 Cookie 智能策略
-- Node.js + yt-dlp-ejs
-- 全局代理环境兼容验证
-- Stage 8.1 多链接解析和 URL 自动清洗
-- Stage 8.1.1 视频解析超时与可取消机制
-- Stage 8.1.2 单按钮解析/取消交互
+- `YoutubeDL.extract_info()` 没有官方 cancellation/abort callback；
+- `progress_hooks` 是下载进度 hook，`extract_info(download=False)` 不会形成可靠解析检查点；
+- 项目的 `_CancellableYtDlpLogger` 只能在 yt-dlp 主动调用 logger 时执行；
+- Requests / urllib 请求同步执行，socket 阻塞期间 logger 没有机会运行；
+- `RequestDirector.send()` 和 `RequestHandler.send()` 没有取消事件检查；
+- 当前单次网络操作主要由解析专用 `socket_timeout=12` 约束；
+- `match_filter` / `DownloadCancelled` 只能在信息提取到相应阶段后中断后续处理；
+- `YoutubeDL.close()` 不是安全的并发取消 API；
+- Python 线程不能通过 `threading.Event` 强制中断已经阻塞的 socket。
 
-### 11.2 当前明确未完成
-
-- 多链接下载
-- 任务队列
-- 并发解析/下载
-- 下载任务的暂停、取消、重试（视频解析取消已支持）
-- 画质选择 UI
-- 重复下载检测
-- 下载目录设置页面
-- FFmpeg 设置页面
-- 完整设置页面
-- Cookie 浏览器自动读取
-- Cookie 自动刷新
-- 内部代理
-- 自动更新 yt-dlp/FFmpeg
-- 播放器
-- PyInstaller 打包
-
-README 不得提前把这些写成已实现。
+结论：当前协作取消机制有效，但无网络时当前请求仍可能等待到 timeout；不存在可以在同一线程内保证“点击后立即中断当前 HTTP socket”的官方机制。
 
 ---
 
-## 12. 测试与当前验证状态
+## 11. 当前实现边界（技术）
 
-### 12.1 Stage 8.1 自动测试
+以下边界是当前代码实现事实，不是长期产品目标：
 
-已执行：
+- 视频信息解析支持多 URL 顺序执行，但不并发；
+- 单个 URL 失败不会阻断后续 URL；
+- 下载仍是一次一个 URL；
+- `app/core/task_manager.py` 是任务管理占位模块；
+- 解析按钮二次点击取消，下载任务没有取消、暂停或重试队列；
+- 解析专用参数是 `socket_timeout=12`、`extractor_retries=1`；
+- 下载参数保持 `socket_timeout=15`、`retries=2`、`fragment_retries=2`；
+- `quality`、`concurrent_tasks`、`avoid_av1`、`output_format` 配置存在，但尚未全部接入完整业务链路；
+- 项目不内置代理，不修改 Windows 系统代理；
+- Cookie 平台策略和代理策略保持解耦；
+- 旧 Worker 的延迟信号通过 Task ID 过滤，不进入新一轮任务。
 
-```powershell
-.venv\Scripts\python.exe -m compileall -q main.py app
-.venv\Scripts\python.exe -m unittest discover -s tests -v
-git diff --check
-git status --short --branch
-```
+长期任务队列、并发下载、画质选择、重复检测、设置页面和打包目标属于 `ROADMAP.md` / 总设计文档，不属于当前已实现能力。
 
-生成本文前结果：
+---
 
-| 测试 | 状态 |
-|---|---|
-| `compileall` | PASS |
-| unittest 自动测试 | PASS |
-| `git diff --check` | PASS |
-| 工作区 | clean（生成 HANDOFF 前） |
-| Git 分支状态 | `main`，ahead 1 |
+## 12. 测试与验证入口
 
-Stage 8.1.1/8.1.2 当前验证结果：
+### 12.1 当前自动测试
 
-| 测试 | 状态 |
-|---|---|
-| unittest 自动测试（23 项） | PASS |
-| Python 语法与核心导入（29 个文件） | PASS |
-| `pip check` | PASS |
-| `git diff --check` | PASS |
-| 离屏完整程序启动到主窗口创建 | PASS |
-| 真实鼠标交互取消 | NOT TESTED |
-| 真实国外网络超时回归 | NOT TESTED |
+当前测试套件包含：
 
-### 12.2 Stage 8.1 测试文件
+- `tests/test_url_extractor.py`
+- `tests/test_video_info_batch_worker.py`
+- `tests/test_main_window_batch.py`
+- `tests/test_stage81_fixes.py`
+- `tests/test_parse_timeout.py`
+- `tests/test_parse_cancellation.py`
 
-#### `tests/test_url_extractor.py`
-
-覆盖：
-
-- 中文文字包围 URL
-- ASCII 和中文包装符号
-- 单行多 URL
-- 多行多 URL
-- query/fragment 保留
-- HTTP 和未知平台
-- 顺序去重
-- 空输入和非法候选
-
-#### `tests/test_video_info_batch_worker.py`
-
-覆盖：
-
-- 顺序解析
-- 中间 URL 失败
-- 后续 URL 继续
-- started/succeeded/failed/finished 信号
-
-#### `tests/test_main_window_batch.py`
-
-覆盖：
-
-- 离屏 GUI 多链接解析
-- 混合成功/失败
-- 事件循环持续响应
-- 按钮状态
-
-#### `tests/test_stage81_fixes.py`
-
-覆盖：
-
-- 解析成功后输入框替换成清洗 URL 列表
-- 无 URL 保留原文
-- 普通、最大化、恢复布局不重叠
-- 解析和下载 options 都启用 `js_runtimes={"node": {}}`
-
-#### `tests/test_parse_timeout.py`
-
-覆盖：
-
-- 正常解析成功
-- 网络超时与连接失败的中文错误区分
-- 其他错误不误报为视频不存在
-- 解析专用超时和提取器重试参数
-- 下载超时、重试和进度参数不回归
-- 取消事件的请求前检查和 yt-dlp logger 检查点
-
-#### `tests/test_parse_cancellation.py`
-
-覆盖：
-
-- 空闲、解析中、取消中和完成后的单按钮状态
-- 二次点击同一按钮启动取消而不是重新解析
-- 重复取消不会异常
-- 旧任务延迟信号不会影响新任务
-- 取消后不启动后续 URL
-- 已成功结果保留
-- 取消不计入普通失败
-- Parser 接收线程安全取消事件
-- 离屏 GUI 点击取消后的状态、按钮恢复和再次解析
-- 解析期间事件循环持续响应
-
-### 12.3 真实网络回归
-
-README 记录的真实回归状态：
-
-| 平台 | 状态 | 说明 |
-|---|---|---|
-| Bilibili Stage 8.1 解析 | PASS | 真实 URL 与无效网页混合解析，单个失败不中断 |
-| Bilibili 下载/FFmpeg | PASS | 之前真实下载约 106,980,236 bytes，H.264+AAC |
-| TikTok 下载 | PASS | 之前真实下载约 39,155,061 bytes，H.264+AAC |
-| X 下载 | PASS（历史回归） | Stage 7.1 收尾回归曾通过；若下一轮无测试 URL，应写 NOT TESTED，不要伪造 |
-| Douyin | PASS（特定 Cookie + 当前出口环境） | 某些出口 IP 返回 HTTP 403/Fresh cookies；更换节点或出口后曾成功 |
-| YouTube Node/EJS + 显式服务层 Cookie | PASS | `eDrH-noimf8` 曾解析并下载成功 |
-| YouTube 默认 NEVER Cookie 项目路径 | FAIL（已知） | 可能触发机器人校验，不能通过改 Cookie 策略掩盖 |
-| v2rayN 关闭环境 | NOT TESTED | 没有擅自切换用户系统代理 |
-
-任何新报告必须明确使用：
-
-- PASS
-- FAIL
-- NOT TESTED
-
-不得把“没测”写成“通过”。
-
-### 12.4 建议的基础验收命令
+基础命令：
 
 ```powershell
-.venv\Scripts\python.exe -m compileall -q main.py app
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 .venv\Scripts\python.exe -m pip check
 git diff --check
-git status --short --branch
 ```
 
-核心导入检查至少包含：
+2026-10-10 文档治理前实际执行结果：
 
-```python
-from app.core.settings import SettingsManager
-from app.core.cookie_file import CookieFileError, resolve_cookie_file
-from app.core.platform_policy import (
-    detect_platform,
-    cookie_mode_for_platform,
-    resolve_cookie_for_url,
-)
-from app.services.ffmpeg_service import FFmpegService
-from app.services.ytdlp_service import YtDlpService
-from app.ui.main_window import MainWindow
-```
+| 检查 | 结果 |
+|---|---|
+| unittest | PASS，23 项 |
+| `pip check` | PASS |
+| Python 语法 / 核心导入 | PASS（文档治理前已检查） |
+| `git diff --check` | PASS |
 
-GUI 测试：
+### 12.2 测试覆盖边界
 
-```powershell
-.venv\Scripts\python.exe main.py
-```
+现有自动测试重点覆盖：
 
-### 12.5 真实下载回归建议
+- URL 提取、清洗和顺序去重；
+- 批量 Worker 顺序执行和失败隔离；
+- 解析 timeout、连接失败和错误分类；
+- 协作取消、结果保留和取消状态；
+- 单按钮交互、Task ID 和旧信号保护；
+- 离屏 GUI 事件循环响应；
+- Node.js runtime options；
+- 下载参数不因解析参数改变。
 
-当前已知测试 URL：
+### 12.3 真实网络回归
+
+历史文档记录过 Bilibili、TikTok、X、Douyin 和 YouTube 的真实解析/下载回归，但本轮文档治理没有重新连接真实平台。
+
+因此：
 
 ```text
-Bilibili:
-https://www.bilibili.com/video/BV1Ebho6BE2J?t=7.9
-
-TikTok:
-https://www.tiktok.com/@prosperx18/video/7685578173676817694
-
-YouTube:
-https://youtu.be/B91bZL8wcAI
-https://www.youtube.com/watch?v=eDrH-noimf8
+真实网络回归：NOT RETESTED（本轮）
+历史记录：见 README 旧记录和相关阶段报告
 ```
 
-真实下载必须记录：
-
-- 平台
-- URL
-- v2rayN/系统代理状态
-- 是否使用 Cookie 策略
-- 是否找到 FFmpeg
-- 是否达到 100%
-- 输出文件大小
-- 视频/音频编码
-- 是否能解码播放
-
-Douyin 当前已知测试 URL 曾为：
-
-```text
-https://www.douyin.com/video/7692287637746437439
-```
-
-该 URL 的结果受 Cookie 和出口 IP 影响，必须如实记录 HTTP 403 或成功结果，不要通过改代码掩盖。
+YouTube 默认 `NEVER` Cookie 策略下的机器人校验是已知历史问题，不应通过修改策略掩盖。
 
 ---
 
@@ -1390,51 +1189,24 @@ git diff --stat
 
 ---
 
-## 15. 下一阶段建议
+## 15. 下一阶段技术入口
 
-### 15.1 当前合理下一步
+下一代码阶段和范围由 `ROADMAP.md` 管理。当前方向是 Stage 8.2：多任务下载队列 / 顺序下载，尚未开始。
 
-Stage 8.1 已完成，下一阶段自然方向是：
+进入 Stage 8.2 前应先设计：
 
-```text
-Stage 8.2：多链接下载 / 下载任务管理准备
-```
+1. 任务模型和状态机；
+2. Core 层队列与 Worker 的边界；
+3. 单线程顺序下载还是真实并发；
+4. `concurrent_tasks` 是否接入；
+5. 任务失败对队列的影响；
+6. 下载取消与解析取消的区分；
+7. Cookie、FFmpeg 和网络环境如何在任务间隔离；
+8. 输出目录冲突和重复检测；
+9. UI 只显示状态，不堆积下载逻辑；
+10. 并发上限、测试方式和回归范围。
 
-但在开发前应先设计，不要直接往 `MainWindow` 堆逻辑。
-
-建议先明确：
-
-1. 一次最多加入多少下载任务
-2. 是继续单任务下载，还是引入任务队列
-3. 任务状态模型如何复用 `DownloadStatus`
-4. `concurrent_tasks` 是否从“预留配置”变成真实并发
-5. 是否实现暂停/取消
-6. 多任务如何共用 `QThreadPool`
-7. 一个平台失败如何影响队列
-8. 如何避免 Cookie 和网络环境在多任务间被错误耦合
-9. 输出目录冲突如何处理
-10. 是否先实现重复检测
-
-### 15.2 不要在下一阶段顺便做
-
-除非用户明确要求：
-
-- 内部代理系统
-- Cookie 浏览器自动导入
-- FFmpeg 自动更新
-- PyInstaller
-- 大规模 UI 重写
-- 修改 AGENTS.md
-- 未经测试宣称功能完成
-
-### 15.3 推荐实施顺序
-
-1. 设计任务模型和状态机
-2. 抽离 Core 层任务队列
-3. 复用现有 `DownloadWorker` / Qt Signal
-4. 用测试验证并发上限
-5. 再扩展 UI
-6. 最后做真实多平台回归
+不要在 Stage 8.2 中顺便实现代理系统、浏览器 Cookie 自动导入、自动更新、PyInstaller 或大规模 UI 重写。
 
 ---
 
@@ -1464,7 +1236,7 @@ Stage 8.2：多链接下载 / 下载任务管理准备
 
 ## 17. 最终接手摘要
 
-当前项目已经稳定完成：
+当前项目的核心技术事实是：
 
 ```text
 基础架构
@@ -1472,21 +1244,22 @@ Stage 8.2：多链接下载 / 下载任务管理准备
 → 单视频下载
 → 下载进度
 → FFmpeg 自动发现
-→ Cookie 文件支持
-→ Cookie 智能策略
-→ 全局代理环境兼容
+→ Cookie 文件和平台策略
+→ 全局网络环境兼容
 → Node.js + yt-dlp-ejs
-→ Stage 8.1 多链接解析与 URL 清洗
+→ Stage 8.1 多链接解析
+→ Stage 8.1.1 超时与取消
+→ Stage 8.1.2 单按钮取消与 Task ID
+→ Stage 8.1.3 可中断机制调查
 ```
 
-当前 Git 最新本地提交为：
+当前实现仍然保持：
 
-```text
-5a5ab0a 实现多链接解析与URL自动清洗
-```
+- 解析顺序执行；
+- 下载一次一个 URL；
+- 不内置代理；
+- 不强制终止线程；
+- Cookie 内容不进入配置、日志或普通 UI；
+- 下载参数、Node.js runtime 和 FFmpeg 发现逻辑不因解析调查而改变。
 
-该提交尚未 push。<br>
-`config/settings.json` 当前恢复为默认 Cookie 空路径。<br>
-工作区在生成本文件前 clean。
-
-下一位助手应优先维护稳定性，先理解、小修改、测试、报告，再根据用户明确指令进入 Stage 8.2。
+当前状态、Git 和验证结果请看 `PROJECT_STATUS.md`，下一阶段请看 `ROADMAP.md`。下一位 Engineer 应先理解、小修改、测试、报告，再等待 Director 确认是否进入 Stage 8.2。
