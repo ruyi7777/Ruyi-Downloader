@@ -40,6 +40,49 @@ class DownloadProgress:
     eta: Optional[int] = None
 
 
+class DownloadTaskStatus(str, Enum):
+    """Queue-level lifecycle for one download task."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {DownloadTaskStatus.COMPLETED, DownloadTaskStatus.FAILED}
+
+
+@dataclass
+class DownloadTask:
+    """One ordered download queue entry, separate from yt-dlp progress."""
+
+    task_id: int
+    url: str
+    title: str = ""
+    status: DownloadTaskStatus = DownloadTaskStatus.QUEUED
+    progress: Optional[DownloadProgress] = None
+    error_message: str = ""
+
+
+@dataclass(frozen=True)
+class DownloadQueueCounts:
+    """Snapshot counts for queue state inspection and GUI summaries."""
+
+    queued: int
+    running: int
+    completed: int
+    failed: int
+
+    @property
+    def total(self) -> int:
+        return self.queued + self.running + self.completed + self.failed
+
+    @property
+    def finished(self) -> int:
+        return self.completed + self.failed
+
+
 @dataclass(frozen=True)
 class DownloadResult:
     """Successful single-video download result."""

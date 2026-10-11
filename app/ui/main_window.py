@@ -1,4 +1,4 @@
-"""Main window for Ruyi Video Downloader URL parsing and single download."""
+"""Main window for Ruyi Video Downloader parsing and download queues."""
 from __future__ import annotations
 
 import logging
@@ -31,14 +31,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.core.download_models import DownloadProgress, DownloadResult, DownloadStatus
+from app.core.download_models import (
+    DownloadProgress,
+    DownloadResult,
+    DownloadStatus,
+    DownloadTask,
+    DownloadTaskStatus,
+)
 from app.core.downloader import VideoDownloader
 from app.core.platform_policy import detect_platform
 from app.core.settings import SettingsManager
 from app.core.url_extractor import extract_http_urls
 from app.core.video_info import VideoInfo
 from app.core.video_info_parser import VideoInfoParser
-from app.ui.download_worker import DownloadWorker
+from app.ui.download_queue_controller import DownloadQueueController
 from app.ui.video_info_worker import VideoInfoBatchWorker
 from app.utils.paths import get_config_path, get_log_file, get_project_root
 
@@ -68,6 +74,29 @@ class MainWindow(QMainWindow):
         self._parse_task_id = 0
         self._active_parse_task_id: int | None = None
         self._parse_cancel_requested = False
+        self._download_queue_controller = DownloadQueueController(
+            downloader=self.downloader,
+        )
+        self._download_queue_snapshots: dict[int, DownloadTask] = {}
+        self._current_queue_task_label = ""
+        self._download_queue_controller.queue_started.connect(
+            self._on_queue_started
+        )
+        self._download_queue_controller.task_started.connect(
+            self._on_queue_task_started
+        )
+        self._download_queue_controller.task_progress.connect(
+            self._on_queue_task_progress
+        )
+        self._download_queue_controller.task_succeeded.connect(
+            self._on_queue_task_succeeded
+        )
+        self._download_queue_controller.task_failed.connect(
+            self._on_queue_task_failed
+        )
+        self._download_queue_controller.queue_finished.connect(
+            self._on_queue_finished
+        )
 
         self.setWindowTitle("如意视频下载器")
         self.setMinimumSize(880, 760)
@@ -93,7 +122,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_label)
         header_layout.addStretch()
 
-        version_label = QLabel("Ruyi Video Downloader · URL 解析与单个视频下载", self)
+        version_label = QLabel("Ruyi Video Downloader · URL 解析与顺序下载队列", self)
         version_label.setObjectName("versionLabel")
         header_layout.addWidget(version_label)
         root_layout.addLayout(header_layout)
@@ -240,6 +269,32 @@ class MainWindow(QMainWindow):
         path_layout.addWidget(self.download_path_value, 1)
         task_layout.addLayout(path_layout)
 
+        queue_label = QLabel("任务队列：", task_group)
+        queue_label.setObjectName("downloadQueueLabel")
+        task_layout.addWidget(queue_label)
+
+        self.download_queue_table = QTableWidget(0, 4, task_group)
+        self.download_queue_table.setObjectName("downloadQueueTable")
+        self.download_queue_table.setHorizontalHeaderLabels(
+            ("序号", "任务", "状态", "错误信息")
+        )
+        self.download_queue_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.download_queue_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.download_queue_table.setAlternatingRowColors(True)
+        self.download_queue_table.verticalHeader().setVisible(False)
+        self.download_queue_table.setMinimumHeight(90)
+        queue_header = self.download_queue_table.horizontalHeader()
+        queue_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        queue_header.setStretchLastSection(True)
+        self.download_queue_table.setColumnWidth(0, 52)
+        self.download_queue_table.setColumnWidth(1, 320)
+        self.download_queue_table.setColumnWidth(2, 110)
+        task_layout.addWidget(self.download_queue_table)
+
         self.download_status = QLabel("等待开始下载", task_group)
         self.download_status.setObjectName("downloadStatus")
         self.download_status.setWordWrap(True)
@@ -277,7 +332,9 @@ class MainWindow(QMainWindow):
         self.download_button = QPushButton("开始下载", task_group)
         self.download_button.setObjectName("downloadButton")
         self.download_button.setEnabled(True)
-        self.download_button.setToolTip("下载当前输入的单个视频，不进行格式合并")
+        self.download_button.setToolTip(
+            "按解析结果顺序下载任务；没有解析结果时支持单个 URL"
+        )
         self.download_button.clicked.connect(self._start_download)
         task_layout.addWidget(self.download_button)
         root_layout.addWidget(task_group)
@@ -484,37 +541,220 @@ class MainWindow(QMainWindow):
         )
 
     def _start_download(self) -> None:
-        """Start one background download without blocking the GUI thread."""
-        if self._is_parsing or self._is_downloading:
+        """Start one sequential queue without blocking the GUI thread."""
+        if (
+            self._is_parsing
+            or self._is_downloading
+            or self._download_queue_controller.is_running
+        ):
             return
 
-        urls = extract_http_urls(self.url_input.toPlainText())
-        if not urls:
-            self._show_download_status(
-                "未找到有效的 HTTP/HTTPS 链接，请检查输入内容",
-                error=True,
-            )
-            return
-        if len(urls) > 1:
-            self._show_download_status(
-                "当前下载功能一次只支持一个视频，请只保留一个链接",
-                error=True,
-            )
-            return
+        queue_items = self._collect_successful_download_items()
+        if not queue_items:
+            urls = extract_http_urls(self.url_input.toPlainText())
+            if not urls:
+                self._show_download_status(
+                    "未找到有效的 HTTP/HTTPS 链接，请检查输入内容",
+                    error=True,
+                )
+                return
+            if len(urls) > 1:
+                self._show_download_status(
+                    "多个链接请先解析，再下载本轮解析成功的视频",
+                    error=True,
+                )
+                return
+            queue_items = [(urls[0], "")]
 
         self._is_downloading = True
+        self._download_queue_snapshots = {}
+        self._current_queue_task_label = ""
         self._set_interaction_state("downloading")
         self._reset_download_progress()
-        self._show_download_status("等待下载", error=False)
-
-        worker = DownloadWorker(
-            urls[0],
-            downloader=self.downloader,
+        self.download_queue_table.setRowCount(0)
+        self._show_download_status(
+            f"准备下载 {len(queue_items)} 个任务…",
+            error=False,
         )
-        worker.signals.progress.connect(self._on_download_progress)
-        worker.signals.succeeded.connect(self._on_download_succeeded)
-        worker.signals.failed.connect(self._on_download_failed)
-        QThreadPool.globalInstance().start(worker)
+
+        if not self._download_queue_controller.start(queue_items):
+            self._is_downloading = False
+            self._set_interaction_state("idle")
+            self._show_download_status("下载队列启动失败", error=True)
+
+    def _collect_successful_download_items(self) -> list[tuple[str, str]]:
+        """Return successful parsed rows in table order."""
+        items: list[tuple[str, str]] = []
+        for row in range(self.parse_results_table.rowCount()):
+            status_item = self.parse_results_table.item(row, 1)
+            if status_item is None or not status_item.text().startswith("成功"):
+                continue
+            video_info = self._parse_results.get(row)
+            if video_info is None:
+                continue
+            url = video_info.webpage_url
+            if not url:
+                url_item = self.parse_results_table.item(row, 6)
+                url = url_item.text() if url_item is not None else ""
+            if url:
+                items.append((url, video_info.title))
+        return items
+
+    @staticmethod
+    def _download_task_status_text(status: DownloadTaskStatus) -> str:
+        return {
+            DownloadTaskStatus.QUEUED: "等待",
+            DownloadTaskStatus.RUNNING: "下载中",
+            DownloadTaskStatus.COMPLETED: "完成",
+            DownloadTaskStatus.FAILED: "失败",
+        }[status]
+
+    def _prepare_download_queue(
+        self,
+        snapshots: tuple[DownloadTask, ...],
+    ) -> None:
+        self.download_queue_table.setRowCount(len(snapshots))
+        for row, task in enumerate(snapshots):
+            display_title = task.title or task.url
+            values = (
+                str(task.task_id),
+                display_title,
+                self._download_task_status_text(task.status),
+                task.error_message,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 1:
+                    item.setToolTip(task.url)
+                self.download_queue_table.setItem(row, column, item)
+            color = "#667085"
+            if task.status is DownloadTaskStatus.RUNNING:
+                color = "#175cd3"
+            elif task.status is DownloadTaskStatus.COMPLETED:
+                color = "#027a48"
+            elif task.status is DownloadTaskStatus.FAILED:
+                color = "#b42318"
+            self.download_queue_table.item(row, 2).setForeground(QColor(color))
+        self.download_queue_table.resizeRowsToContents()
+
+    def _update_download_queue_task(
+        self,
+        task: DownloadTask,
+        error_message: str = "",
+    ) -> None:
+        self._download_queue_snapshots[task.task_id] = task
+        row = task.task_id - 1
+        if row < 0 or row >= self.download_queue_table.rowCount():
+            return
+        status_item = self.download_queue_table.item(row, 2)
+        if status_item is not None:
+            status_item.setText(
+                self._download_task_status_text(task.status)
+            )
+            color = "#667085"
+            if task.status is DownloadTaskStatus.RUNNING:
+                color = "#175cd3"
+            elif task.status is DownloadTaskStatus.COMPLETED:
+                color = "#027a48"
+            elif task.status is DownloadTaskStatus.FAILED:
+                color = "#b42318"
+            status_item.setForeground(QColor(color))
+        error_item = self.download_queue_table.item(row, 3)
+        if error_item is not None:
+            error_item.setText(
+                error_message or task.error_message
+            )
+
+    def _on_queue_started(
+        self,
+        snapshots: tuple[DownloadTask, ...],
+        counts,
+    ) -> None:
+        if not self._is_downloading:
+            return
+        self._download_queue_snapshots = {
+            task.task_id: task for task in snapshots
+        }
+        self._prepare_download_queue(snapshots)
+        self._show_download_status(
+            f"下载队列已开始：共 {counts.total} 个任务",
+            error=False,
+        )
+
+    def _on_queue_task_started(self, task: DownloadTask) -> None:
+        if not self._is_downloading:
+            return
+        self._update_download_queue_task(task)
+        total = self.download_queue_table.rowCount()
+        title = task.title or task.url
+        self._current_queue_task_label = (
+            f"第 {task.task_id} / {total} 个：{title}"
+        )
+        self._reset_download_progress()
+        self._show_download_status(
+            f"正在下载第 {task.task_id} / {total} 个：{title}",
+            error=False,
+        )
+
+    def _on_queue_task_progress(
+        self,
+        task: DownloadTask,
+        progress: DownloadProgress,
+    ) -> None:
+        if not self._is_downloading:
+            return
+        self._update_download_queue_task(task)
+        self._on_download_progress(progress)
+
+    def _on_queue_task_succeeded(
+        self,
+        task: DownloadTask,
+        _result: DownloadResult,
+    ) -> None:
+        if not self._is_downloading:
+            return
+        self._update_download_queue_task(task)
+        self._show_download_status(
+            f"任务 {task.task_id} 下载完成",
+            error=False,
+        )
+
+    def _on_queue_task_failed(
+        self,
+        task: DownloadTask,
+        user_message: str,
+        _detail: str,
+    ) -> None:
+        if not self._is_downloading:
+            return
+        self._update_download_queue_task(task, error_message=user_message)
+        self._show_download_status(
+            f"任务 {task.task_id} 下载失败：{user_message}",
+            error=True,
+        )
+
+    def _on_queue_finished(self, snapshots, counts) -> None:
+        if not self._is_downloading:
+            return
+
+        self._is_downloading = False
+        self._download_queue_snapshots = {
+            task.task_id: task for task in snapshots
+        }
+        self._prepare_download_queue(snapshots)
+        self._current_queue_task_label = ""
+        self._set_interaction_state("idle")
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(0)
+        self.download_progress_bar.setFormat("队列结束")
+        self.download_speed_value.setText("速度：—")
+        self.download_downloaded_value.setText("已下载：—")
+        self.download_eta_value.setText("剩余时间：—")
+        self._show_download_status(
+            f"下载队列完成：成功 {counts.completed} 个，"
+            f"失败 {counts.failed} 个",
+            error=counts.failed > 0,
+        )
 
     def _set_interaction_state(self, state: str) -> None:
         busy = state != "idle"
@@ -793,6 +1033,8 @@ class MainWindow(QMainWindow):
         self.download_eta_value.setText("剩余时间：—")
 
     def _set_download_progress_status(self, message: str, error: bool) -> None:
+        if self._current_queue_task_label:
+            message = f"{self._current_queue_task_label}｜{message}"
         self.download_status.setText(message)
         color = "#b42318" if error else "#175cd3"
         self.download_status.setStyleSheet(f"color: {color};")

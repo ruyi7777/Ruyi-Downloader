@@ -97,6 +97,8 @@ D:\xiangmu\ruyi\video tiqu\
 ├── AGENTS.md
 ├── README.md
 ├── HANDOFF.md
+├── PROJECT_STATUS.md
+├── ROADMAP.md
 ├── requirements.txt
 ├── .gitignore
 ├── 如意下载总设计文档.txt
@@ -122,6 +124,7 @@ D:\xiangmu\ruyi\video tiqu\
 │   │
 │   ├── ui/
 │   │   ├── __init__.py
+│   │   ├── download_queue_controller.py
 │   │   ├── download_worker.py
 │   │   ├── main_window.py
 │   │   ├── video_info_worker.py
@@ -137,7 +140,12 @@ D:\xiangmu\ruyi\video tiqu\
 │   └── settings.json
 │
 ├── tests/
+│   ├── test_download_queue_controller.py
+│   ├── test_download_task_manager.py
 │   ├── test_main_window_batch.py
+│   ├── test_main_window_download_queue.py
+│   ├── test_parse_cancellation.py
+│   ├── test_parse_timeout.py
 │   ├── test_stage81_fixes.py
 │   ├── test_url_extractor.py
 │   └── test_video_info_batch_worker.py
@@ -189,7 +197,7 @@ D:\xiangmu\ruyi\video tiqu\
 - 解析流程协调
 - 单视频下载流程协调
 - 下载状态和进度模型
-- 未来任务管理
+- 下载任务状态机和 FIFO 队列快照
 
 #### `app/services/`
 
@@ -270,35 +278,48 @@ MainWindow 更新解析表格和视频信息区域
 - 单个 URL 失败会发 `failed(index, user_message, detail)`，随后继续下一个 URL
 - 最终发 `finished(success_count, failure_count)`
 
-### 4.3 单视频下载链路
+### 4.3 顺序下载队列链路
 
 ```text
 MainWindow._start_download
+    ↓ 收集解析结果表中的成功行，或单 URL 直接入队
+DownloadQueueController.start
     ↓
-DownloadWorker（QRunnable，后台线程）
+TaskManager.enqueue_many（FIFO，QUEUED）
+    ↓
+TaskManager.get_next_queued → RUNNING
+    ↓
+每次只创建一个 DownloadWorker（QRunnable，后台线程）
     ↓
 VideoDownloader.download
     ↓
-平台 Cookie 策略
-    ↓
-FFmpegService.discover
+平台 Cookie 策略 / FFmpegService.discover
     ↓
 YtDlpService.download_video
     ↓
 yt-dlp progress hook
     ↓ DownloadWorker.throttled progress Signal
-MainWindow 更新百分比、速度、大小、ETA
+DownloadQueueController 按 generation + task_id 过滤旧信号
     ↓
-DownloadResult / DownloadError
-    ↓ Qt Signal
-MainWindow 显示成功或失败
+TaskManager 更新 COMPLETED / FAILED
+    ↓
+自动启动下一个 QUEUED 任务
+    ↓
+队列结束时发送 snapshots + counts
+    ↓
+MainWindow 更新任务表、当前进度和成功/失败汇总
 ```
 
-当前下载仍严格限制为**一次一个 URL**：
+Stage 8.2 下载规则：
 
-- 无 URL：中文错误
-- 多于一个 URL：提示“当前下载功能一次只支持一个视频”
-- 不要把它误认为已经完成 Stage 8.2 多链接下载
+- 同一时间最多一个 `RUNNING` 任务；
+- 按解析结果表顺序执行；
+- 解析失败或取消行不入队；
+- 单个 URL 无解析结果时也走同一队列；
+- 多个原始 URL 无解析结果时提示先解析；
+- 一个任务失败后继续下一个；
+- 不读取 `concurrent_tasks`；
+- 不实现下载取消、暂停、继续或重试。
 
 ### 4.4 GUI 线程规则
 
@@ -906,7 +927,7 @@ finished(success_count, failure_count)
 
 ### 10.5 Stage 8.1 未包含
 
-以下都不是 Stage 8.1：
+以下都不是 Stage 8.1（该阶段当时下载仍为单 URL）：
 
 - 多链接下载
 - 任务队列
@@ -976,9 +997,11 @@ Stage 8.1.2 只调整 GUI 交互，不重新实现取消机制：
 
 - 视频信息解析支持多 URL 顺序执行，但不并发；
 - 单个 URL 失败不会阻断后续 URL；
-- 下载仍是一次一个 URL；
-- `app/core/task_manager.py` 是任务管理占位模块；
-- 解析按钮二次点击取消，下载任务没有取消、暂停或重试队列；
+- 下载按队列顺序执行，同一时间最多一个 RUNNING 任务；
+- `app/core/task_manager.py` 已实现纯 FIFO 状态机；
+- 下载通过 `DownloadQueueController` 顺序执行，但没有下载取消、暂停或重试队列；
+- 队列任务状态为 QUEUED / RUNNING / COMPLETED / FAILED；
+- `DownloadProgress.PARTIAL_FINISHED` 只属于进度，不是任务终态；
 - 解析专用参数是 `socket_timeout=12`、`extractor_retries=1`；
 - 下载参数保持 `socket_timeout=15`、`retries=2`、`fragment_retries=2`；
 - `quality`、`concurrent_tasks`、`avoid_av1`、`output_format` 配置存在，但尚未全部接入完整业务链路；
@@ -1002,6 +1025,9 @@ Stage 8.1.2 只调整 GUI 交互，不重新实现取消机制：
 - `tests/test_stage81_fixes.py`
 - `tests/test_parse_timeout.py`
 - `tests/test_parse_cancellation.py`
+- `tests/test_download_task_manager.py`
+- `tests/test_download_queue_controller.py`
+- `tests/test_main_window_download_queue.py`
 
 基础命令：
 
@@ -1011,13 +1037,15 @@ Stage 8.1.2 只调整 GUI 交互，不重新实现取消机制：
 git diff --check
 ```
 
-2026-10-10 文档治理前实际执行结果：
+2026-10-11 Stage 8.2 实际执行结果：
 
 | 检查 | 结果 |
 |---|---|
-| unittest | PASS，23 项 |
+| unittest | PASS，37 项 |
+| 新增测试 | 14 项 |
+| 已有测试回归 | 23 项 PASS |
 | `pip check` | PASS |
-| Python 语法 / 核心导入 | PASS（文档治理前已检查） |
+| Python 语法 / 核心导入 | PASS |
 | `git diff --check` | PASS |
 
 ### 12.2 测试覆盖边界
@@ -1031,7 +1059,10 @@ git diff --check
 - 单按钮交互、Task ID 和旧信号保护；
 - 离屏 GUI 事件循环响应；
 - Node.js runtime options；
-- 下载参数不因解析参数改变。
+- 下载参数不因解析参数改变；
+- Core FIFO、合法状态转换、失败继续和队列统计；
+- 控制器单任务执行、旧信号过滤、当前进度归属和单次结束；
+- GUI 成功行入队、失败行排除、失败继续、单 URL 直连和控件恢复。
 
 ### 12.3 真实网络回归
 
@@ -1183,7 +1214,7 @@ git diff --stat
 - `options["js_runtimes"] = {"node": {}}` 仍同时存在于解析和下载 options
 - 未新增内部代理
 - 未改变 Cookie 平台策略
-- 未把 Stage 8.2 内容混入本阶段
+- 未混入 Stage 8.3 并发、下载取消、重试或其他未批准功能
 
 用户明确要求前不执行 commit。
 
@@ -1191,22 +1222,20 @@ git diff --stat
 
 ## 15. 下一阶段技术入口
 
-下一代码阶段和范围由 `ROADMAP.md` 管理。当前方向是 Stage 8.2：多任务下载队列 / 顺序下载，尚未开始。
+Stage 8.2 顺序下载队列已实现。下一代码阶段由 `ROADMAP.md` 管理，方向是 Stage 8.3：2 线程并发下载，尚未开始。
 
-进入 Stage 8.2 前应先设计：
+进入 Stage 8.3 前应先设计：
 
-1. 任务模型和状态机；
-2. Core 层队列与 Worker 的边界；
-3. 单线程顺序下载还是真实并发；
-4. `concurrent_tasks` 是否接入；
-5. 任务失败对队列的影响；
-6. 下载取消与解析取消的区分；
-7. Cookie、FFmpeg 和网络环境如何在任务间隔离；
-8. 输出目录冲突和重复检测；
-9. UI 只显示状态，不堆积下载逻辑；
-10. 并发上限、测试方式和回归范围。
+1. `concurrent_tasks` 如何从预留配置接入真实并发；
+2. 最大并发数和线程池上限；
+3. 多任务进度如何按 task_id 隔离；
+4. Cookie、FFmpeg 和网络环境如何在任务间共享；
+5. 输出目录和日志并发安全；
+6. GUI 如何同时显示多个任务状态；
+7. 失败、暂停和取消是否仍推迟；
+8. 并发上限测试和真实网络回归范围。
 
-不要在 Stage 8.2 中顺便实现代理系统、浏览器 Cookie 自动导入、自动更新、PyInstaller 或大规模 UI 重写。
+不要在 Stage 8.3 中顺便实现代理系统、浏览器 Cookie 自动导入、自动更新、PyInstaller 或大规模 UI 重写。
 
 ---
 
@@ -1227,7 +1256,7 @@ git diff --stat
 8. 项目不内置代理系统。
 9. Node.js 通过 PATH 查找，不硬编码。
 10. FFmpeg 自动发现不依赖修改系统 PATH。
-11. 当前下载仍是一次一个视频，除非下一阶段明确实现。
+11. Stage 8.2 下载队列严格顺序执行，同一时间最多一个 RUNNING 任务。
 12. 不为了测试通过而修改无关架构或伪造结果。
 13. 未经用户明确要求，不执行破坏性 Git 操作。
 14. 所有报告明确 PASS / FAIL / NOT TESTED。
@@ -1251,15 +1280,16 @@ git diff --stat
 → Stage 8.1.1 超时与取消
 → Stage 8.1.2 单按钮取消与 Task ID
 → Stage 8.1.3 可中断机制调查
+→ Stage 8.2 批量下载任务队列 / 顺序执行
 ```
 
 当前实现仍然保持：
 
 - 解析顺序执行；
-- 下载一次一个 URL；
+- 下载队列顺序执行，同一时间一个 RUNNING 任务；
 - 不内置代理；
 - 不强制终止线程；
 - Cookie 内容不进入配置、日志或普通 UI；
 - 下载参数、Node.js runtime 和 FFmpeg 发现逻辑不因解析调查而改变。
 
-当前状态、Git 和验证结果请看 `PROJECT_STATUS.md`，下一阶段请看 `ROADMAP.md`。下一位 Engineer 应先理解、小修改、测试、报告，再等待 Director 确认是否进入 Stage 8.2。
+当前状态、Git 和验证结果请看 `PROJECT_STATUS.md`，下一阶段请看 `ROADMAP.md`。下一位 Engineer 应先理解、小修改、测试、报告，再等待 Director 确认是否进入 Stage 8.3。

@@ -30,6 +30,7 @@
 | Stage 8.1.1 | 解析专用 12 秒 timeout、1 次 extractor retry、错误分类、协作取消 | 提交 `dc14afc` 中的代码和测试 |
 | Stage 8.1.2 | 单按钮二次点击取消、取消中状态、Task ID 防旧 Worker 信号 | 提交 `dc14afc` 及当前代码 |
 | Stage 8.1.3 | 调查 yt-dlp `extract_info` 的可中断能力 | 只读调查完成，无业务代码变更 |
+| Stage 8.2 | 下载任务模型、FIFO Core 状态机、顺序队列控制器、GUI 队列表和失败继续 | 当前实现及 14 项新增测试，待 Director 审查 |
 
 ### Stage 8.1.3 调查结论
 
@@ -46,36 +47,27 @@
 当前状态：
 
 ```text
-代码阶段：Stage 8.1.3 技术调查已完成
-代码工作区：以 PROJECT_STATUS.md 实际 Git 状态为准
-文档治理：六文档体系整理
-下一代码阶段：Stage 8.2
+代码阶段：Stage 8.2 顺序下载队列实现完成，等待 Director 审查
+代码工作区：以 PROJECT_STATUS.md 实际 Git diff 为准
+当前测试：37 项 PASS
+下一代码阶段：Stage 8.3
 ```
 
-Stage 8.2 尚未开始，不得把规划内容写成当前功能。
+Stage 8.2 已包含：
+
+- `DownloadTask` / `DownloadTaskStatus`；
+- Core `TaskManager` FIFO 状态机；
+- `DownloadQueueController` 单任务顺序调度；
+- generation + task_id 旧信号过滤；
+- MainWindow 成功行入队、单 URL 直连和队列表；
+- 失败继续与成功/失败汇总；
+- Core、控制器和离屏 GUI 新增测试。
+
+Stage 8.3 尚未开始，不得把规划内容写成当前功能。
 
 ## 三、下一阶段
 
-### Stage 8.2：多任务下载队列 / 顺序下载
-
-目标：
-
-- 建立任务模型和状态机；
-- 支持多个下载任务顺序入队；
-- 复用现有单任务 DownloadWorker；
-- 明确任务失败对后续队列的影响；
-- 保持当前下载参数、Cookie、FFmpeg 和代理约束；
-- 不在 `MainWindow` 中堆积复杂队列逻辑。
-
-开始前需要确认：
-
-- 一次最多加入多少任务；
-- 是否继续单线程顺序下载；
-- 任务状态如何复用 `DownloadStatus`；
-- `concurrent_tasks` 是否从预留配置变为真实并发；
-- 是否先实现重复检测；
-- 输出目录冲突如何处理；
-- 队列取消和单任务取消如何区分。
+下一阶段为 Stage 8.3：2 线程并发下载，尚未开始。详细要求见下一节；开工前必须由 Director 明确并发数、进度隔离、线程池上限和真实网络回归范围。
 
 ## 四、计划阶段
 
